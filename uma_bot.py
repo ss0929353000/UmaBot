@@ -12,6 +12,7 @@ import ctypes
 import json
 import os
 import queue
+import random
 import re
 import sys
 import threading
@@ -118,9 +119,9 @@ TEMPLATE_GROUPS = [
         "end_next": "领奖画面的「下项」（左半边，避开闪光圈）",
         "end_next_b": "结算画面的「下项」（左半边，避开闪光圈）",
     }),
-    ("自动启动游戏（UU 加速器）", "uu_", {
-        "uu_tile": "UU 首页里「赛马娘Pretty Derby」这几个字",
-        "uu_start": "UU 加速后的「启动游戏」按钮",
+    ("自动启动游戏（加速器）", "uu_", {
+        "uu_tile": "（UU 专用）首页里「赛马娘Pretty Derby」这几个字",
+        "uu_start": "（UU 专用）加速后的「启动游戏」按钮",
     }),
     ("剧情跳过", "story_", {
         "story_list": "剧情列表的标题，用来判断在列表画面",
@@ -157,11 +158,15 @@ def step_name(key):
 
 
 DEFAULT_CFG = {
+    "dmm_only": False,         # 不开加速器，每次都直接用 DMM 快捷方式打开游戏
+    "humanize": True,          # 点击位置在按钮范围内随机、速度随机
     "minimize_others": True,   # 开游戏 / 开始操作时，把游戏以外的窗口全部最小化
     "minimize_on_start": True,  # 点启动后程序自己缩到任务栏，不挡住游戏
     "custom_modes": {},
     "auto_launch": False,      # 每轮结束后关游戏，下一轮前用 UU 加速器重新启动
-    "uu_path": "",
+    "uu_path": "",             # 加速器（或游戏启动器）的位置
+    "game_path": "",           # DMM 游戏快捷方式
+    "acc_order": [],           # 其他加速器：要依序点的按钮
     "launch_lead": 5,          # 提前几分钟启动游戏
     "launch_wait": 5,          # 启动后最多等几分钟进入主页
     "auto_focus": False,
@@ -305,6 +310,76 @@ def minimize_other_windows(keep_hwnd):
         except Exception:
             pass
     return len(targets)
+
+
+def shortcut_target(path):
+    """.lnk 快捷方式 → 真正的 exe 路径；其他文件原样回传。"""
+    if path.lower().endswith(".lnk"):
+        try:
+            import win32com.client
+            t = win32com.client.Dispatch("WScript.Shell").CreateShortCut(path).Targetpath
+            if t:
+                return t
+        except Exception:
+            pass
+    return path
+
+
+def process_running(exe_name):
+    """用 tasklist 看某个程序有没有在跑。"""
+    try:
+        import subprocess
+        out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {exe_name}", "/NH"],
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        return exe_name.lower() in out.lower()
+    except Exception:
+        return False
+
+
+def rand_point(pt, box, on=True):
+    """在按钮范围内随机挑一点：靠中间的机率高，不会点到边缘外。box = (宽, 高)。"""
+    if not on:
+        return pt
+    w, h = box if box else (16, 10)
+    dx = max(-0.35, min(0.35, random.gauss(0, 0.15))) * w
+    dy = max(-0.3, min(0.3, random.gauss(0, 0.13))) * h
+    return int(pt[0] + dx), int(pt[1] + dy)
+
+
+def human_press(x, y, on=True):
+    """移动过去再按下放开；开了随机化时，移动快慢、按住时间都不固定。"""
+    if on:
+        pyautogui.moveTo(x, y, duration=random.uniform(0.08, 0.28), tween=pyautogui.easeOutQuad)
+        time.sleep(random.uniform(0.02, 0.09))
+        pyautogui.mouseDown()
+        time.sleep(random.uniform(0.045, 0.14))
+        pyautogui.mouseUp()
+    else:
+        pyautogui.moveTo(x, y)
+        pyautogui.mouseDown()
+        time.sleep(0.05)
+        pyautogui.mouseUp()
+
+
+def own_windows():
+    """本程序自己的窗口（找加速器按钮时要排除）。"""
+    me = os.getpid()
+    out = []
+
+    def cb(h, _):
+        try:
+            if win32gui.IsWindowVisible(h) and not win32gui.IsIconic(h) \
+                    and win32process.GetWindowThreadProcessId(h)[1] == me:
+                out.append(h)
+        except Exception:
+            pass
+
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception:
+        pass
+    return out
 
 
 def is_foreground(hwnd):
@@ -597,8 +672,13 @@ class Bot(threading.Thread):
         self.next_run = None
         self.paused = 0.0
         self.state_text = None
+        self.last_box = {}
+        self.launched_once = False
         self.next_label = "下次执行"
         self.uu_scale = None
+        self.screen_scale = {}
+        self.screen_best = {}
+        self.screen_last = {}
         self.f = 1.0
         self.full = None
         self.last_small = None
@@ -687,6 +767,7 @@ class Bot(threading.Thread):
             base = lap(t)
             if base > 1 and lap(reg) / base < 0.25:
                 return None
+        self.last_box[pt] = (w, h)
         return pt
 
     def click(self, pt, label):
@@ -697,13 +778,15 @@ class Bot(threading.Thread):
             return
         self.rect = client_rect(hwnd)
         x, y, w, h = self.rect
-        px, py = int(pt[0] / self.f), int(pt[1] / self.f)
+        on = self.cfg.get("humanize", True)
+        rp = rand_point(pt, self.last_box.get(pt), on)
+        self.last_box.clear()
+        px, py = int(rp[0] / self.f), int(rp[1] / self.f)
         if not (0 <= px < w and 0 <= py < h):
-            return
-        pyautogui.moveTo(x + px, y + py)
-        pyautogui.mouseDown()
-        time.sleep(0.05)
-        pyautogui.mouseUp()
+            px, py = int(pt[0] / self.f), int(pt[1] / self.f)
+            if not (0 <= px < w and 0 <= py < h):
+                return
+        human_press(x + px, y + py, on)
         self.log(f"点击 {label}", "ok")
         changed = prev is None
         if prev is not None:
@@ -716,7 +799,8 @@ class Bot(threading.Thread):
                 if cur.shape == prev.shape and float(cv2.absdiff(cur, prev).mean()) > 3:
                     changed = True
                     break
-        self.wait(self.cfg["delay"])
+        extra = random.uniform(0, 0.35) if self.cfg.get("humanize", True) else 0
+        self.wait(self.cfg["delay"] + extra)
         return changed
 
     def run(self):
@@ -1171,73 +1255,200 @@ class Bot(threading.Thread):
             pass
 
     # ---- 自动启动 / 关闭游戏 ----
-    def find_on_screen(self, key, thr=0.8):
-        """在整个桌面找 UU 加速器的按钮。界面大小不同时自动试缩放，找到后记住。"""
+    SCREEN_SCALES = [1.0, 0.9, 1.1, 0.8, 1.25, 0.75, 1.33, 1.5, 0.67, 1.75, 2.0]
+
+    def find_on_screen(self, key, thr=0.75):
+        """在整个桌面找加速器的按钮。每个按钮各自记住合适的缩放；先在半尺寸画面上找，速度快很多。"""
         path = tpl_path(key)
         tpl = cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_COLOR) if os.path.exists(path) else None
         if tpl is None:
             return None
         img, left, top = grab_screen()
-        scales = [self.uu_scale] if self.uu_scale else [1.0, 0.9, 1.1, 0.8, 1.25, 0.75, 1.33, 1.5, 0.67, 1.75, 2.0]
+        img = img.copy()
+        for h_ in own_windows():
+            try:
+                l, t_, r, b = win32gui.GetWindowRect(h_)
+                img[max(0, t_ - top):max(0, b - top), max(0, l - left):max(0, r - left)] = 0
+            except Exception:
+                pass
+        small = cv2.resize(img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        known = self.screen_scale.get(key)
+        scales = [known] if known else self.SCREEN_SCALES
         best = None
         for sc in scales:
-            t = tpl if sc == 1.0 else cv2.resize(tpl, None, fx=sc, fy=sc,
-                                                 interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR)
-            if t.shape[0] > img.shape[0] or t.shape[1] > img.shape[1]:
+            f = sc * 0.5
+            t = cv2.resize(tpl, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+            if t.shape[0] < 8 or t.shape[1] < 8 or t.shape[0] > small.shape[0] or t.shape[1] > small.shape[1]:
                 continue
-            _, mx, _, loc = cv2.minMaxLoc(cv2.matchTemplate(img, t, cv2.TM_CCOEFF_NORMED))
-            if mx >= thr and (best is None or mx > best[0]):
+            _, mx, _, loc = cv2.minMaxLoc(cv2.matchTemplate(small, t, cv2.TM_CCOEFF_NORMED))
+            if best is None or mx > best[0]:
                 best = (mx, sc, loc, t.shape)
-        if not best:
+        if best is None:
             return None
+        self.screen_best[key] = max(self.screen_best.get(key, 0), best[0])
+        self.screen_last[key] = best[0]
+        if best[0] < thr:
+            if known:  # 记住的缩放不灵了（窗口大小变了），下次重新试
+                self.screen_scale.pop(key, None)
+            return None
+        self.screen_scale[key] = best[1]
         self.uu_scale = best[1]
         (x, y), (h, w) = best[2], best[3][:2]
-        return left + x + w // 2, top + y + h // 2
+        pt = left + (x + w // 2) * 2, top + (y + h // 2) * 2
+        self.last_box[pt] = (w * 2, h * 2)
+        return pt
 
     def click_screen(self, pt, label):
-        pyautogui.moveTo(*pt)
-        pyautogui.mouseDown()
-        time.sleep(0.05)
-        pyautogui.mouseUp()
+        on = self.cfg.get("humanize", True)
+        rp = rand_point(pt, self.last_box.get(pt), on)
+        self.last_box.clear()
+        human_press(rp[0], rp[1], on)
         self.log(f"点击 {label}", "ok")
 
-    def launch_game(self):
-        """打开 UU 加速器 → 点赛马娘加速 → 启动游戏 → 等游戏窗口 → 进入主页。"""
-        path = self.cfg.get("uu_path", "")
-        if not path or not os.path.exists(path):
-            self.log("没有设置 UU 加速器的位置，无法自动启动。请到「设置」页选择", "err")
-            return False
-        self.log("自动启动游戏：打开 UU 加速器")
-        self.state_text = "正在启动游戏…"
+    def launch_by_steps(self, steps):
+        """自己设定的加速器按钮：按顺序找到就点，每一步最多等 60 秒。"""
+        for n, key in enumerate(steps, 1):
+            end = time.time() + 60
+            while not self.stop_evt.is_set():
+                pt = self.find_on_screen(key)
+                if pt:
+                    self.click_screen(pt, f"加速器第 {n} 步：{key[4:]}")
+                    self.wait(3)
+                    break
+                if time.time() > end:
+                    self.log(f"加速器里等了 60 秒都没看到「{key[4:]}」（最高相似度 {self.screen_best.get(key, 0):.2f}）。"
+                             f"可到「模板」页重截", "warn")
+                    return False
+                self.wait(1.5)
+        return not self.stop_evt.is_set()
+
+    def wait_game_started(self, secs):
+        """点了启动后，看游戏有没有真的开始启动（游戏窗口或游戏程序出现）。"""
+        end = time.time() + secs
+        while time.time() < end and not self.stop_evt.is_set():
+            if find_window(self.cfg["window_title"]) or process_running("umamusume.exe"):
+                return True
+            self.wait(2)
+        return False
+
+    def save_click_shot(self, pt, name):
+        """把这次点击的位置画在截图上存到 debug 文件夹，方便确认到底点到哪里。"""
         try:
-            os.startfile(path)
-        except OSError as e:
-            self.log(f"打开 UU 加速器失败：{e}", "err")
-            self.state_text = None
-            return False
-        self.wait(3)
-        deadline = time.time() + 90
-        launched = False
+            img, left, top = grab_screen()
+            img = img.copy()
+            x, y = pt[0] - left, pt[1] - top
+            cv2.circle(img, (x, y), 18, (0, 0, 255), 4)
+            cv2.line(img, (x - 30, y), (x + 30, y), (0, 0, 255), 2)
+            cv2.line(img, (x, y - 30), (x, y + 30), (0, 0, 255), 2)
+            d = os.path.join(BASE, "debug")
+            os.makedirs(d, exist_ok=True)
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
+                buf.tofile(os.path.join(d, f"click_{name}_{time.strftime('%H%M%S')}.jpg"))
+        except Exception:
+            pass
+
+    def launch_by_uu(self):
+        """UU 加速器：点封面开始加速，再点「启动游戏」。"""
+        deadline = time.time() + 240
+        last_report = time.time()
+        tile_at = 0.0   # 上次点封面的时间
+        start_clicks = 0
         while time.time() < deadline and not self.stop_evt.is_set():
-            pt = self.find_on_screen("uu_start")
+            pt = self.find_on_screen("uu_start", thr=0.88)
+            if pt and not tile_at and self.screen_last.get("uu_start", 0) < 0.93:
+                pt = None  # 还没点封面加速，又不是非常像：多半认错了
             if pt:
-                self.click_screen(pt, "UU：启动游戏")
-                launched = True
-                break
+                # 详情页刚滑进来、加速刚连上时按钮可能还没反应：先等一下再确认位置
+                self.wait(2)
+                pt = self.find_on_screen("uu_start", thr=0.88) or pt
+                start_clicks += 1
+                self.click_screen(pt, f"UU：启动游戏（第 {start_clicks} 次）")
+                self.save_click_shot(pt, "uu_start")
+                self.state_text = "等 DMM 启动游戏…"
+                if self.wait_game_started(45):
+                    self.log("游戏已开始启动", "ok")
+                    return True
+                if start_clicks >= 3:
+                    self.log("点了 3 次「启动游戏」游戏都没开。debug 文件夹里有点击位置的截图，可以发给作者看", "warn")
+                    return False
+                self.log("点了「启动游戏」45 秒都没看到游戏启动，再点一次", "warn")
+                continue
+            # 点了封面后 UU 要转圈加速几秒，期间封面还在，不能再点（再点会取消加速）
+            if time.time() - tile_at < 25:
+                self.state_text = "UU 正在加速，等「启动游戏」出现…"
+                self.wait(1)
+                continue
             pt = self.find_on_screen("uu_tile")
             if pt:
-                # 文字标签本身点了没用，要点它正上方的游戏封面图（约 165 像素 × 缩放）
-                sc = self.uu_scale or 1.0
-                pt = (pt[0], pt[1] - int(165 * sc))
+                t = cv2.imdecode(np.fromfile(tpl_path("uu_tile"), np.uint8), cv2.IMREAD_COLOR)
+                if t is not None and t.shape[1] > t.shape[0] * 3:
+                    # 截的是「赛马娘Pretty Derby」文字：点它正上方的封面图（约 165 像素 × 缩放）
+                    pt = (pt[0], pt[1] - int(165 * self.screen_scale.get("uu_tile", 1.0)))
                 self.click_screen(pt, "UU：赛马娘封面（立即加速）")
-                self.wait(4)
+                tile_at = time.time()
+                self.wait(3)
                 continue
-            self.wait(1.5)
-        if not launched:
-            self.state_text = None
-            if not self.stop_evt.is_set():
-                self.log("UU 加速器里找不到「启动游戏」。请确认 UU 已登录，或到「模板」页重截 uu_ 开头的模板", "warn")
-            return False
+            if time.time() > last_report + 15:
+                last_report = time.time()
+                self.log("还在找加速器里的按钮（最像的：" + "、".join(
+                    f"{k} {v:.2f}" for k, v in self.screen_best.items()) + "）。确认加速器窗口没被挡住", "warn")
+            self.wait(1)
+        if not self.stop_evt.is_set():
+            self.log("UU 加速器里找不到「启动游戏」。不是用 UU 的话，请到「模板」页把你加速器的按钮按顺序加到"
+                     "「自动启动：加速器按钮」", "warn")
+        return False
+
+    def launch_game(self):
+        """打开加速器 → 依序点按钮（加速、启动游戏）→ 等游戏窗口 → 进入主页。"""
+        path = self.cfg.get("uu_path", "")
+        game = self.cfg.get("game_path", "")
+        has_game = bool(game) and os.path.exists(game)
+        acc_exe = os.path.basename(shortcut_target(path)) if path else ""
+        if self.cfg.get("dmm_only"):
+            if not has_game:
+                self.log("开了「不开加速器，直接用 DMM 快捷方式」但还没选快捷方式的位置。请到「设置」页选择", "err")
+                return False
+            self.state_text = "正在启动游戏…"
+            self.log("直接用 DMM 快捷方式打开游戏（不开加速器）")
+            try:
+                os.startfile(game)
+            except OSError as e:
+                self.log(f"打开 DMM 快捷方式失败：{e}", "err")
+                self.state_text = None
+                return False
+        # 第一次：从加速器点「启动游戏」；之后：加速器还开着就直接打开 DMM 快捷方式
+        elif self.launched_once and has_game and (not acc_exe.lower().endswith(".exe") or process_running(acc_exe)):
+            self.state_text = "正在启动游戏…"
+            self.log("再次启动：直接用 DMM 快捷方式打开游戏")
+            try:
+                os.startfile(game)
+            except OSError as e:
+                self.log(f"打开 DMM 快捷方式失败：{e}", "err")
+                self.state_text = None
+                return False
+        else:
+            if self.launched_once and has_game:
+                self.log("加速器好像已经关了，这次重新从加速器启动", "warn")
+            if not path or not os.path.exists(path):
+                self.log("没有设置加速器的位置，无法自动启动。请到「设置」页选择", "err")
+                return False
+            self.log("自动启动游戏：打开加速器")
+            self.state_text = "正在启动游戏…"
+            try:
+                os.startfile(path)
+            except OSError as e:
+                self.log(f"打开加速器失败：{e}", "err")
+                self.state_text = None
+                return False
+            self.wait(3)
+            steps = [k for k in self.cfg.get("acc_order", []) if os.path.exists(tpl_path(k))]
+            is_uu = "uu" in acc_exe.lower() and os.path.exists(tpl_path("uu_tile")) and os.path.exists(tpl_path("uu_start"))
+            ok = self.launch_by_uu() if (is_uu or not steps) else self.launch_by_steps(steps)
+            if not ok:
+                self.state_text = None
+                return False
+            self.launched_once = True
 
         # 等游戏窗口出现（DMM 会自己启动游戏）
         end = time.time() + 180
@@ -1602,8 +1813,11 @@ class App:
         self.v_auto_focus = tk.BooleanVar(value=self.cfg.get("auto_focus", False))
         self.v_minimize = tk.BooleanVar(value=self.cfg.get("minimize_on_start", True))
         self.v_min_others = tk.BooleanVar(value=self.cfg.get("minimize_others", True))
+        self.v_humanize = tk.BooleanVar(value=self.cfg.get("humanize", True))
         self.v_auto_launch = tk.BooleanVar(value=self.cfg.get("auto_launch", False))
         self.v_uu_path = tk.StringVar(value=self.cfg.get("uu_path", ""))
+        self.v_game_path = tk.StringVar(value=self.cfg.get("game_path", ""))
+        self.v_dmm_only = tk.BooleanVar(value=self.cfg.get("dmm_only", False))
         self.v_launch_lead = tk.IntVar(value=self.cfg.get("launch_lead", 5))
         self.v_launch_wait = tk.IntVar(value=self.cfg.get("launch_wait", 5))
         self.v_autoscroll = tk.BooleanVar(value=True)
@@ -2203,17 +2417,31 @@ class App:
                        variable=self.v_minimize, bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
         tb.Checkbutton(box, text="开游戏和每轮开始操作时，把游戏以外的窗口全部最小化",
                        variable=self.v_min_others, bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
+        tb.Checkbutton(box, text="点击位置在按钮范围内随机、点击速度随机",
+                       variable=self.v_humanize, bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
         tb.Button(box, text="保存设置", bootstyle="success", command=self.save_settings).pack(anchor=W, pady=(12, 0))
 
-        lb = tb.Labelframe(f, text="自动启动游戏（UU 加速器）", padding=14)
+        lb = tb.Labelframe(f, text="自动启动游戏（加速器）", padding=14)
         lb.pack(anchor=W, fill=X, pady=(14, 0))
-        tb.Checkbutton(lb, text="每轮结束后关闭游戏，下一轮前自动从 UU 加速器启动",
+        tb.Checkbutton(lb, text="每轮结束后关闭游戏，下一轮前自动从加速器启动",
                        variable=self.v_auto_launch, bootstyle="success-round-toggle").pack(anchor=W)
         pr = tb.Frame(lb)
         pr.pack(fill=X, pady=(10, 4))
-        tb.Label(pr, text="UU 加速器位置").pack(side=LEFT)
+        tb.Label(pr, text="加速器位置").pack(side=LEFT)
         tb.Entry(pr, textvariable=self.v_uu_path).pack(side=LEFT, fill=X, expand=True, padx=6)
         tb.Button(pr, text="浏览…", bootstyle="secondary-outline", command=self.pick_uu).pack(side=LEFT)
+        gr = tb.Frame(lb)
+        gr.pack(fill=X, pady=(4, 4))
+        tb.Label(gr, text="DMM 游戏快捷方式").pack(side=LEFT)
+        tb.Entry(gr, textvariable=self.v_game_path).pack(side=LEFT, fill=X, expand=True, padx=6)
+        tb.Button(gr, text="浏览…", bootstyle="secondary-outline", command=self.pick_game).pack(side=LEFT)
+        tb.Checkbutton(lb, text="不开加速器，每次都直接用 DMM 快捷方式打开游戏",
+                       variable=self.v_dmm_only, bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
+        tb.Label(lb, text="没开上面这个时：第一次从加速器点「启动游戏」；之后加速器还开着，就直接打开 DMM 快捷方式（没填就每次都走加速器）",
+                 bootstyle="secondary").pack(anchor=W, pady=(4, 0))
+        self.lbl_acc = tb.Label(lb, text="", bootstyle="secondary", justify=LEFT)
+        self.lbl_acc.pack(anchor=W, pady=(6, 4))
+        self.refresh_acc_hint()
         self.row(lb, "提前几分钟启动游戏",
                  lambda p: tb.Spinbox(p, from_=1, to=30, textvariable=self.v_launch_lead, width=7))
         self.row(lb, "启动后最多等几分钟进入主页",
@@ -2380,8 +2608,11 @@ class App:
                 auto_focus=bool(self.v_auto_focus.get()),
                 minimize_on_start=bool(self.v_minimize.get()),
                 minimize_others=bool(self.v_min_others.get()),
+                humanize=bool(self.v_humanize.get()),
                 auto_launch=bool(self.v_auto_launch.get()),
                 uu_path=self.v_uu_path.get().strip().strip('"'),
+                game_path=self.v_game_path.get().strip().strip('"'),
+                dmm_only=bool(self.v_dmm_only.get()),
                 launch_lead=int(self.v_launch_lead.get()),
                 launch_wait=int(self.v_launch_wait.get()),
             )
@@ -2405,6 +2636,9 @@ class App:
             for k, d in custom.items():
                 if prefix == "btn_" and k.startswith(("btn_", "auto_")):
                     merged[k] = d
+            if prefix == "uu_":
+                for n, k in enumerate(self.cfg.get("acc_order", []), 1):
+                    merged[k] = f"加速器第 {n} 步（设定后优先用这些，不用 UU 那两个）"
             for k, d in merged.items():
                 ok = os.path.exists(tpl_path(k))
                 self.tree.insert(gid, "end", iid=k, text=k, values=(d, "✓ 已截取" if ok else "✗ 未截取"),
@@ -2437,7 +2671,8 @@ class App:
         return sel[0]
 
     def update_prefix_choices(self):
-        self.prefix_map = {"通用按钮（看到就点）": "btn_", "育成结束阶段": "auto_end_", "育成开始阶段": "auto_start_"}
+        self.prefix_map = {"通用按钮（看到就点）": "btn_", "育成结束阶段": "auto_end_", "育成开始阶段": "auto_start_",
+                           "自动启动：加速器按钮（按顺序）": "acc_"}
         for mid, m in self.cfg.get("custom_modes", {}).items():
             self.prefix_map[f"模式：{m['name']}"] = f"m_{mid}_"
         if hasattr(self, "cmb_prefix"):
@@ -2468,7 +2703,13 @@ class App:
             return
         prefix = self.prefix_map.get(self.v_prefix.get(), "btn_")
         key = prefix + name
-        if prefix.startswith("m_"):
+        if prefix == "acc_":
+            order = self.cfg.setdefault("acc_order", [])
+            if key not in order:
+                order.append(key)
+            desc = f"加速器第 {order.index(key) + 1} 步"
+            self.refresh_acc_hint()
+        elif prefix.startswith("m_"):
             mid = prefix[2:-1]
             m = self.cfg["custom_modes"][mid]
             if key not in m["order"]:
@@ -2506,6 +2747,9 @@ class App:
             meta.pop(key, None)
             save_meta(meta)
         custom.pop(key, None)
+        if key in self.cfg.get("acc_order", []):
+            self.cfg["acc_order"].remove(key)
+            self.refresh_acc_hint()
         if key.startswith("m_"):
             for m in self.cfg.get("custom_modes", {}).values():
                 if key in m.get("order", []):
@@ -2540,7 +2784,7 @@ class App:
         if not key:
             messagebox.showinfo(APP_NAME, "先在列表里选中要截的模板")
             return
-        if key.startswith("uu_"):  # UU 加速器的按钮在桌面上，截整个屏幕
+        if key.startswith(("uu_", "acc_")):  # 加速器的按钮在桌面上，截整个屏幕
             self.root.iconify()
 
             def do():
@@ -2622,8 +2866,27 @@ class App:
 
         self.grab_game(then)
 
+    def refresh_acc_hint(self):
+        if not hasattr(self, "lbl_acc"):
+            return
+        order = self.cfg.get("acc_order", [])
+        if order:
+            names = " → ".join(step_name(k)[4:] if k.startswith("acc_") else k for k in order)
+            self.lbl_acc.configure(text=f"加速器按钮（按顺序点）：{names}。在「模板」页可增删和重截")
+        else:
+            self.lbl_acc.configure(text="默认按 UU 加速器的流程点击。\n"
+                                        "用其他加速器（雷神、奇游等）：到「模板」页「添加按钮到」选「自动启动：加速器按钮（按顺序）」，\n"
+                                        "把要点的按钮（例如「开始加速」「启动游戏」）按顺序加进去并截图。")
+
+    def pick_game(self):
+        p = filedialog.askopenfilename(title="选择 DMM 游戏快捷方式（桌面上的赛马娘图标）",
+                                       filetypes=[("快捷方式或程序", "*.lnk *.url *.exe"), ("所有文件", "*.*")])
+        if p:
+            self.v_game_path.set(os.path.normpath(p))
+            self.save_settings(quiet=True)
+
     def pick_uu(self):
-        p = filedialog.askopenfilename(title="选择 UU 加速器（程序或桌面快捷方式）",
+        p = filedialog.askopenfilename(title="选择加速器（程序或桌面快捷方式）",
                                        filetypes=[("程序或快捷方式", "*.exe *.lnk"), ("所有文件", "*.*")])
         if p:
             self.v_uu_path.set(os.path.normpath(p))
