@@ -57,6 +57,7 @@ BASE = os.path.dirname(os.path.abspath(sys.argv[0]))
 TPL_DIR = os.path.join(BASE, "templates")
 CFG_PATH = os.path.join(BASE, "config.json")
 FANS_PATH = os.path.join(BASE, "fans.json")
+JEWEL_RESET_HOUR = 4  # 萝卜的「一天」从凌晨 4 点算起（和游戏每日刷新一致）
 STATE_PATH = os.path.join(BASE, "state.json")
 
 
@@ -1037,7 +1038,7 @@ class Bot(threading.Thread):
             if r["jewels_after"] is not None:
                 st["jewels"] = r["jewels_after"]
                 st["jewels_t"] = datetime.now().strftime("%H:%M")
-                day = FanStore.day_of(datetime.now(), self.cfg.get("fan_reset_hour", 0)).isoformat()
+                day = FanStore.day_of(datetime.now(), JEWEL_RESET_HOUR).isoformat()
                 log = st.setdefault("jewel_log", {})
                 if day not in log:
                     first = r["jewels_before"] if r["jewels_before"] is not None else r["jewels_after"]
@@ -1987,11 +1988,12 @@ class App:
         ent.pack(side=LEFT, padx=6)
         ent.bind("<Return>", lambda e: self.record_jewel_now())
         tb.Button(inp, text="记录", bootstyle="success", command=self.record_jewel_now).pack(side=LEFT)
-        tb.Label(jf, text="填一次后会随每轮育成自动更新", bootstyle="secondary",
+        tb.Label(jf, text="填一次后随每轮育成自动更新，每天凌晨 4 点重新计算", bootstyle="secondary",
                  font=(FONT, 9)).grid(row=1, column=0, sticky=W, pady=(6, 0))
         self.lbl_jnow = tb.Label(jf, text="", font=(FONT, 12, "bold"), foreground=PALETTE["fg"])
         self.lbl_jnow.grid(row=0, column=1, sticky=W, padx=(24, 0))
-        self.lbl_jtoday = tb.Label(jf, text="", bootstyle="secondary")
+        self.lbl_jtoday = tb.Label(jf, text="", bootstyle="secondary", cursor="hand2")
+        self.lbl_jtoday.bind("<Double-Button-1>", self.edit_jewel_start)
         self.lbl_jtoday.grid(row=1, column=1, sticky=W, padx=(24, 0), pady=(6, 0))
         self.lbl_jgain = tb.Label(jf, text="", font=(FONT, 12, "bold"), foreground=PALETTE["success"])
         self.lbl_jgain.grid(row=0, column=2, sticky=W, padx=(24, 0))
@@ -2214,7 +2216,7 @@ class App:
             self.fans.remove(sel)
 
     def jewel_day(self, offset=0):
-        return (FanStore.day_of(datetime.now(), self.cfg.get("fan_reset_hour", 0)) - timedelta(days=offset)).isoformat()
+        return (FanStore.day_of(datetime.now(), JEWEL_RESET_HOUR) - timedelta(days=offset)).isoformat()
 
     def record_jewel_now(self):
         t = self.v_jewel_now.get().replace(",", "").replace("，", "").strip()
@@ -2222,12 +2224,34 @@ class App:
             messagebox.showerror(APP_NAME, "请输入现在的萝卜数量，例如 33806")
             return
         st = load_state()
-        st.setdefault("jewel_log", {})[self.jewel_day()] = {"n": int(t), "manual": True}
+        log = st.setdefault("jewel_log", {})
+        day = self.jewel_day()
+        # 只更新「当前」；今天开始的数字保留，只有今天还没记录过才用这次的当起点
+        if day not in log:
+            log[day] = {"n": int(t), "manual": True}
+            self.log(f"已记录今天开始的萝卜：{int(t):,}", "ok")
+        else:
+            self.log(f"已更新当前萝卜：{int(t):,}，今天已获得 {int(t) - log[day]['n']:+,}", "ok")
         st["jewels"] = int(t)
         st["jewels_t"] = datetime.now().strftime("%H:%M")
         save_state(st)
         self.v_jewel_now.set("")
-        self.log(f"已记录今天开始的萝卜：{int(t):,}", "ok")
+        self.refresh_jewel_box()
+
+    def edit_jewel_start(self, _=None):
+        """双击「今天开始」可以改今天的起点。"""
+        from tkinter import simpledialog
+        st = load_state()
+        log = st.setdefault("jewel_log", {})
+        day = self.jewel_day()
+        cur = log.get(day, {}).get("n")
+        v = simpledialog.askinteger(APP_NAME, "今天（凌晨 4 点后）开始时的萝卜数量：",
+                                    initialvalue=cur, minvalue=0, parent=self.root)
+        if v is None:
+            return
+        log[day] = {"n": v, "manual": True}
+        save_state(st)
+        self.log(f"已把今天开始的萝卜改成 {v:,}", "ok")
         self.refresh_jewel_box()
 
     def tick_jewel(self):
@@ -2249,15 +2273,15 @@ class App:
             self.lbl_jnow.configure(text="当前：—")
             self.lbl_jgain.configure(text="")
         if today:
-            self.lbl_jtoday.configure(text=f"今天开始：{today['n']:,}（{'手动' if today.get('manual') else '自动'}）")
+            self.lbl_jtoday.configure(text=f"今天开始：{today['n']:,}（{'手动' if today.get('manual') else '自动'}，双击可改）")
         else:
             self.lbl_jtoday.configure(text="今天开始：还没记录")
         if today and yest:
             d = today["n"] - yest["n"]
             self.lbl_jyest.configure(text=f"昨天获得：{d:+,}")
         else:
-            j = self.fans.daily(self.cfg.get("fan_reset_hour", 0)).get(
-                FanStore.day_of(datetime.now(), self.cfg.get("fan_reset_hour", 0)) - timedelta(days=1))
+            j = self.fans.daily(JEWEL_RESET_HOUR).get(
+                FanStore.day_of(datetime.now(), JEWEL_RESET_HOUR) - timedelta(days=1))
             if j and j[2]:
                 self.lbl_jyest.configure(text=f"昨天获得：{j[1]:+,}（按每轮统计）")
             else:
