@@ -1,0 +1,8 @@
+opencv-python
+numpy
+mss
+pyautogui
+pywin32
+pillow
+pynput
+ttkbootstrap
