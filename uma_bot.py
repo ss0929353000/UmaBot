@@ -383,6 +383,58 @@ def own_windows():
     return out
 
 
+def process_name(pid):
+    try:
+        h = win32api.OpenProcess(0x0410, False, pid)
+        try:
+            return os.path.basename(win32process.GetModuleFileNameEx(h, 0)).lower()
+        finally:
+            win32api.CloseHandle(h)
+    except Exception:
+        return ""
+
+
+def find_uu_window():
+    """找 UU 加速器的主窗口（最大的那个可见窗口）。"""
+    best = None
+
+    def cb(h, _):
+        nonlocal best
+        try:
+            if not win32gui.IsWindowVisible(h):
+                return
+            title = win32gui.GetWindowText(h)
+            pid = win32process.GetWindowThreadProcessId(h)[1]
+            name = process_name(pid)
+            if not (name.startswith("uu") or "UU加速器" in title or "网易UU" in title):
+                return
+            l, t, r, b = win32gui.GetWindowRect(h)
+            area = (r - l) * (b - t)
+            if r - l > 400 and b - t > 300 and (best is None or area > best[0]):
+                best = (area, h)
+        except Exception:
+            pass
+
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception:
+        pass
+    return best[1] if best else None
+
+
+def show_window(hwnd):
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
+        force_foreground(hwnd)
+    except Exception:
+        pass
+
+
+# UU 窗口里的相对位置（从你录的影片量出来的；UU 窗口的版面固定，只会跟着缩放）
+UU_REL = {"tile": (0.169, 0.324), "start": (0.105, 0.477)}
+
+
 def is_foreground(hwnd):
     try:
         fg = win32gui.GetForegroundWindow()
@@ -680,6 +732,7 @@ class Bot(threading.Thread):
         self.screen_scale = {}
         self.screen_best = {}
         self.screen_last = {}
+        self.screen_black = False
         self.f = 1.0
         self.full = None
         self.last_small = None
@@ -1256,7 +1309,7 @@ class Bot(threading.Thread):
             pass
 
     # ---- 自动启动 / 关闭游戏 ----
-    SCREEN_SCALES = [1.0, 0.9, 1.1, 0.8, 1.25, 0.75, 1.33, 1.5, 0.67, 1.75, 2.0]
+    SCREEN_SCALES = [1.0, 0.9, 1.1, 0.8, 1.25, 0.75, 1.33, 0.67, 1.5, 0.6, 1.75, 0.5, 2.0, 0.4, 2.5, 0.33]
 
     def find_on_screen(self, key, thr=0.75):
         """在整个桌面找加速器的按钮。每个按钮各自记住合适的缩放；先在半尺寸画面上找，速度快很多。"""
@@ -1265,6 +1318,7 @@ class Bot(threading.Thread):
         if tpl is None:
             return None
         img, left, top = grab_screen()
+        self.screen_black = float(img.std()) < 4  # 远程桌面最小化或断开时，截到的是全黑画面
         img = img.copy()
         for h_ in own_windows():
             try:
@@ -1272,14 +1326,15 @@ class Bot(threading.Thread):
                 img[max(0, t_ - top):max(0, b - top), max(0, l - left):max(0, r - left)] = 0
             except Exception:
                 pass
-        small = cv2.resize(img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        small = cv2.cvtColor(cv2.resize(img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+        tpl = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)
         known = self.screen_scale.get(key)
         scales = [known] if known else self.SCREEN_SCALES
         best = None
         for sc in scales:
             f = sc * 0.5
             t = cv2.resize(tpl, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
-            if t.shape[0] < 8 or t.shape[1] < 8 or t.shape[0] > small.shape[0] or t.shape[1] > small.shape[1]:
+            if t.shape[0] < 6 or t.shape[1] < 6 or t.shape[0] > small.shape[0] or t.shape[1] > small.shape[1]:
                 continue
             _, mx, _, loc = cv2.minMaxLoc(cv2.matchTemplate(small, t, cv2.TM_CCOEFF_NORMED))
             if best is None or mx > best[0]:
@@ -1353,8 +1408,25 @@ class Bot(threading.Thread):
         """UU 加速器：点封面开始加速，再点「启动游戏」。"""
         deadline = time.time() + 240
         last_report = time.time()
+        began = time.time()
         tile_at = 0.0   # 上次点封面的时间
         start_clicks = 0
+        rel_used = False
+
+        def rel_point(name):
+            hw = find_uu_window()
+            if not hw:
+                return None
+            show_window(hw)
+            self.wait(0.8)
+            l, t, r, b = win32gui.GetWindowRect(hw)
+            rx, ry = UU_REL[name]
+            return int(l + (r - l) * rx), int(t + (b - t) * ry)
+
+        hw = find_uu_window()
+        if hw:
+            show_window(hw)  # 远程控制时 UU 常被挡住或缩在托盘：先把它叫到最前面
+            self.wait(1)
         while time.time() < deadline and not self.stop_evt.is_set():
             pt = self.find_on_screen("uu_start", thr=0.88)
             if pt and not tile_at and self.screen_last.get("uu_start", 0) < 0.93:
@@ -1375,12 +1447,39 @@ class Bot(threading.Thread):
                     return False
                 self.log("点了「启动游戏」45 秒都没看到游戏启动，再点一次", "warn")
                 continue
+            # 认不出「启动游戏」：加速 12 秒后改用固定位置点
+            if not pt and tile_at and time.time() - tile_at > 12 and start_clicks < 3 \
+                    and (rel_used or time.time() - tile_at > 30):
+                rp = rel_point("start")
+                if rp:
+                    start_clicks += 1
+                    self.log("认不出「启动游戏」按钮，改用 UU 窗口里的固定位置点击", "warn")
+                    self.last_box[rp] = (40, 14)
+                    self.click_screen(rp, f"UU：启动游戏（按窗口位置，第 {start_clicks} 次）")
+                    self.save_click_shot(rp, "uu_start")
+                    self.state_text = "等 DMM 启动游戏…"
+                    if self.wait_game_started(45):
+                        self.log("游戏已开始启动", "ok")
+                        return True
+                    continue
             # 点了封面后 UU 要转圈加速几秒，期间封面还在，不能再点（再点会取消加速）
             if time.time() - tile_at < 25:
                 self.state_text = "UU 正在加速，等「启动游戏」出现…"
                 self.wait(1)
                 continue
             pt = self.find_on_screen("uu_tile")
+            if not pt and not tile_at and time.time() - began > 25:
+                # 25 秒都认不出封面（远程分辨率、颜色变了）：改用 UU 窗口里的固定位置
+                pt = rel_point("tile")
+                if pt:
+                    rel_used = True
+                    self.log("认不出封面图，改用 UU 窗口里的固定位置点击", "warn")
+                    self.last_box[pt] = (60, 60)
+                    self.click_screen(pt, "UU：赛马娘封面（按窗口位置）")
+                    self.save_click_shot(pt, "uu_tile")
+                    tile_at = time.time()
+                    self.wait(3)
+                    continue
             if pt:
                 t = cv2.imdecode(np.fromfile(tpl_path("uu_tile"), np.uint8), cv2.IMREAD_COLOR)
                 if t is not None and t.shape[1] > t.shape[0] * 3:
@@ -1390,7 +1489,11 @@ class Bot(threading.Thread):
                 tile_at = time.time()
                 self.wait(3)
                 continue
-            if time.time() > last_report + 15:
+            if time.time() > last_report + 15 and self.screen_black:
+                last_report = time.time()
+                self.log("截到的桌面是全黑的：远程桌面窗口被最小化或断开时，Windows 不会画画面，程序看不到也点不了。"
+                         "请让远程窗口保持打开（不要最小化）", "err")
+            elif time.time() > last_report + 15:
                 last_report = time.time()
                 self.log("还在找加速器里的按钮（最像的：" + "、".join(
                     f"{k} {v:.2f}" for k, v in self.screen_best.items()) + "）。确认加速器窗口没被挡住", "warn")
