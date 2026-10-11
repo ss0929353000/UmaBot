@@ -48,12 +48,13 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.2"
+VERSION = "3.3"
 SUBTITLE = "by-Yung"
 FEEDBACK_EMAIL = "363111444@qq.com"
 FONT = "Microsoft YaHei UI"
 
-BASE = os.path.dirname(os.path.abspath(sys.argv[0]))
+# exe 版：程序代码在 app 文件夹里，但设置、模板、记录都在 exe 旁边
+BASE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]))
 TPL_DIR = os.path.join(BASE, "templates")
 CFG_PATH = os.path.join(BASE, "config.json")
 FANS_PATH = os.path.join(BASE, "fans.json")

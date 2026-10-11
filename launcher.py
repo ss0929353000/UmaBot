@@ -5,7 +5,6 @@ exe 旁边的 app\\uma_bot.py。自动更新时只要换掉这个文件，不用
 """
 import os
 import re
-import runpy
 import shutil
 import sys
 import traceback
@@ -81,7 +80,11 @@ def main():
         messagebox.showerror("赛马娘助手", "找不到程序文件 app\\uma_bot.py，请重新下载完整的程序。")
         return
     try:
-        runpy.run_path(code, run_name="__main__")
+        # 不用 runpy.run_path：它会把 sys.argv[0] 改成 app\uma_bot.py，程序就会去 app 文件夹找设置和模板
+        with open(code, encoding="utf-8") as f:
+            src = f.read()
+        g = {"__name__": "__main__", "__file__": code, "__builtins__": __builtins__}
+        exec(compile(src, code, "exec"), g)
     except SystemExit:
         raise
     except Exception:
