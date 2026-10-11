@@ -48,7 +48,26 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.3"
+VERSION = "3.4"
+# 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
+# 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
+CHANGELOG = [
+    ("3.4", "2026-10-11", [
+        "新增：更新后第一次打开会显示这次更新了什么（就是这个公告）",
+        "新增：「设置」页可以随时点「更新公告」查看历史更新",
+    ]),
+    ("3.3", "2026-10-11", [
+        "修正：exe 版更新后找不到模板、设置和记录的问题",
+    ]),
+    ("3.2", "2026-10-11", [
+        "新增：体力饮料（和宝石）回复次数用完、TP 还不够时自动停止，不再开新一轮（「运行」页可关闭）",
+    ]),
+    ("3.1", "2026-10-11", [
+        "新增：GitHub 自动更新，打开程序时会提示新版本，也可以在「设置」页点「检查更新」",
+        "优化：UU 加速流程放慢，悬停封面等「立即加速」完全出现再点，加速稳定 10 秒后再点「启动游戏」",
+        "修正：UU 只在加速器窗口里找按钮，不会再点到桌面空白处",
+    ]),
+]
 SUBTITLE = "by-Yung"
 FEEDBACK_EMAIL = "363111444@qq.com"
 FONT = "Microsoft YaHei UI"
@@ -2303,6 +2322,7 @@ def restart_program():
 class App:
     def __init__(self, root):
         self.root = root
+        self.cfg_existed = os.path.exists(CFG_PATH)   # 没有 config.json＝第一次安装，不用弹更新公告
         self.cfg = load_cfg()
         self.log_q = queue.Queue()
         self.bot = None
@@ -2361,6 +2381,7 @@ class App:
         if pynput_kb:
             pynput_kb.Listener(on_press=self.on_key).start()
         self.log(f"{APP_NAME} v{VERSION} 已就绪")
+        root.after(900, self.maybe_show_whats_new)
         if self.cfg.get("auto_update", True):
             root.after(2500, lambda: self.check_update(manual=False))
 
@@ -2998,6 +3019,8 @@ class App:
         self.btn_update = tb.Button(ur, text="检查更新", bootstyle="primary-outline",
                                     command=lambda: self.check_update(manual=True))
         self.btn_update.pack(side=LEFT, padx=(12, 0))
+        tb.Button(ur, text="更新公告", bootstyle="secondary-outline",
+                  command=lambda: self.show_changelog(CHANGELOG, "更新公告")).pack(side=LEFT, padx=(8, 0))
         tb.Checkbutton(ub, text="打开程序时自动检查 GitHub 上有没有新版本",
                        variable=self.v_auto_update, bootstyle="success-round-toggle",
                        command=lambda: self.save_settings(quiet=True)).pack(anchor=W, pady=(8, 0))
@@ -3534,6 +3557,72 @@ class App:
             self.fans.changed = False
             self.refresh_fans()
         self.root.after(200, self.poll)
+
+    # ---------- 更新公告 ----------
+    def maybe_show_whats_new(self):
+        """版本号跟上次打开时不一样（刚更新完）就弹出这次更新的内容。"""
+        seen = self.cfg.get("last_seen_version")
+        if seen == VERSION:
+            return
+        self.cfg["last_seen_version"] = VERSION
+        try:
+            save_cfg(self.cfg)
+        except Exception:
+            pass
+        if seen is None and not self.cfg_existed:
+            return  # 第一次安装
+        if seen is None:   # 从还没有公告功能的旧版本升级上来：显示最近几次的更新
+            items = CHANGELOG[:4]
+        else:
+            items = [e for e in CHANGELOG if ver_tuple(e[0]) > ver_tuple(seen)]
+        if items:
+            self.log(f"已更新到 v{VERSION}", "ok")
+            self.show_changelog(items, f"已更新到 v{VERSION}")
+
+    def show_changelog(self, items, title):
+        s = self.ui_scale()
+        win = tb.Toplevel(self.root)
+        win.title(f"{APP_NAME}  {title}")
+        win.transient(self.root)
+        head = tb.Frame(win, bootstyle="primary", padding=(18, 12))
+        head.pack(fill=X)
+        tb.Label(head, text=title, font=(FONT, 15, "bold"), bootstyle="inverse-primary").pack(side=LEFT)
+        tb.Label(head, text="  更新内容", font=(FONT, 10), bootstyle="inverse-primary").pack(side=LEFT, pady=(4, 0))
+        tb.Frame(win, height=3, bootstyle="warning").pack(fill=X)
+        body = tb.Frame(win, padding=(18, 14, 18, 6))
+        body.pack(fill=BOTH, expand=True)
+        txt = tk.Text(body, wrap="word", relief="flat", bd=0, highlightthickness=0, cursor="arrow",
+                      bg=PALETTE["bg"], fg=PALETTE["fg"], font=(FONT, 10), padx=4, pady=4,
+                      width=58, height=min(20, 3 + sum(len(e[2]) + 2 for e in items)), spacing1=2, spacing3=4)
+        sb = tb.Scrollbar(body, orient=VERTICAL, command=txt.yview, bootstyle="round")
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side=RIGHT, fill=Y)
+        txt.pack(side=LEFT, fill=BOTH, expand=True)
+        txt.tag_configure("ver", font=(FONT, 12, "bold"), foreground=PALETTE["primary"], spacing1=8)
+        txt.tag_configure("date", font=(FONT, 9), foreground=PALETTE["secondary"])
+        txt.tag_configure("item", lmargin1=8, lmargin2=26)
+        txt.tag_configure("dot", foreground=GOLD, font=(FONT, 10, "bold"))
+        for i, (ver, day, lines) in enumerate(items):
+            if i:
+                txt.insert("end", "\n")
+            txt.insert("end", f"v{ver}", "ver")
+            txt.insert("end", f"   {day}" + ("   （现在的版本）" if ver == VERSION else "") + "\n", "date")
+            for ln in lines:
+                txt.insert("end", "◆  ", ("item", "dot"))
+                txt.insert("end", ln + "\n", "item")
+        txt.configure(state=DISABLED)
+        foot = tb.Frame(win, padding=(18, 6, 18, 14))
+        foot.pack(fill=X)
+        tb.Label(foot, text="设置、模板、粉丝和萝卜记录都已保留", bootstyle="secondary").pack(side=LEFT)
+        tb.Button(foot, text="知道了", bootstyle="success", width=10, command=win.destroy).pack(side=RIGHT)
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.minsize(int(420 * s), int(240 * s))
+        win.lift()
+        win.focus_force()
 
     # ---------- 自动更新 ----------
     def check_update(self, manual=False):

@@ -69,8 +69,8 @@ python uma_bot.py
 
 ## 发布新版本（作者用）
 
-1. 改好 `uma_bot.py`，把里面的 `VERSION = "x.y"` 调大。
-2. 运行 `python make_release.py "这次更新了什么"`，会生成 `version.json`（含版本号、更新内容和校验码）。
+1. 改好 `uma_bot.py`，把里面的 `VERSION = "x.y"` 调大，并在 `CHANGELOG` 最上面加一条这次的更新内容（用户更新后第一次打开会弹出这个公告）。
+2. 运行 `python make_release.py`，会生成 `version.json`（含版本号、更新内容和校验码，更新内容自动取自 `CHANGELOG`）。
 3. 把 `uma_bot.py` 和 `version.json` 一起上传到 GitHub 的 `main` 分支。
 
 用户下次打开程序就会收到更新提示。程序会先连 GitHub，连不上再改用 jsDelivr 镜像（镜像可能晚几分钟到几小时才同步）。下载的文件要校验码一致、而且能正常编译才会替换，旧版会备份到 `app\backup\`；新版万一打不开，启动器会自动退回 exe 内附的版本。
