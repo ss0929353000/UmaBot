@@ -7,6 +7,10 @@ if not exist uma_bot.py (
   echo [错误] 找不到 uma_bot.py，请先把压缩包完整解压
   pause & exit /b 1
 )
+if not exist launcher.py (
+  echo [错误] 找不到 launcher.py，请先把压缩包完整解压
+  pause & exit /b 1
+)
 where python >nul 2>nul || (
   echo [错误] 未找到 Python，请先安装 Python 3.10 以上，并勾选 Add Python to PATH
   pause & exit /b 1
@@ -31,16 +35,19 @@ if exist icon.ico (
 set DONATE_ARGS=
 if exist donate.jpg set DONATE_ARGS=--add-data "donate.jpg;."
 
-echo [2/2] 打包 exe...
+echo [2/2] 打包 exe（只需要打包这一次，以后在软件里点「检查更新」就能更新）...
 python -m PyInstaller --onefile --noconsole --clean --name UmaBot %ICON_ARGS% %DONATE_ARGS% ^
+  --add-data "uma_bot.py;." ^
   --collect-all ttkbootstrap ^
   --hidden-import pynput.keyboard._win32 ^
   --hidden-import pynput.mouse._win32 ^
-  uma_bot.py || (
+  launcher.py || (
   echo [错误] 打包失败
   pause & exit /b 1
 )
 
+if not exist dist\app mkdir dist\app
+copy /y uma_bot.py dist\app\uma_bot.py >nul
 if exist templates xcopy /e /i /y templates dist\templates >nul
 if exist config.json copy /y config.json dist\ >nul
 if exist icon.ico copy /y icon.ico dist\ >nul

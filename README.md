@@ -26,7 +26,9 @@ cd UmaBot
 build.bat
 ```
 
-完成后运行 `dist\UmaBot.exe`。也可以不打包，直接运行：
+完成后运行 `dist\UmaBot.exe`。**exe 只需要打包这一次**：以后有新版本，打开程序时会自动提示，点「是」就会从 GitHub 下载更新并重新打开（也可以在「设置」页点「检查更新」）。设置、模板、粉丝和萝卜记录都会保留。
+
+也可以不打包，直接运行（这种方式请用 `git pull` 更新）：
 
 ```bat
 pip install -r requirements.txt
@@ -57,10 +59,23 @@ python uma_bot.py
 
 | 文件 | 说明 |
 | --- | --- |
-| `uma_bot.py` | 程序本体 |
+| `uma_bot.py` | 程序本体（exe 版会放在 `dist\app\uma_bot.py`，自动更新就是换掉这个文件） |
+| `launcher.py` | exe 启动器：exe 里只打包启动器和依赖，启动时载入 `app\uma_bot.py` |
+| `version.json` | 最新版本号和更新内容，程序靠它判断有没有新版本 |
+| `make_release.py` | 发布新版本时生成 `version.json` |
 | `build.bat` | 一键安装依赖并打包成 exe |
 | `templates/` | 自己截取的按钮模板放这里（不上传）；`topbar_digits.npz` 是数字识别特征 |
 | `config.json` / `fans.json` / `state.json` | 运行后自动生成的个人设置与记录，已在 `.gitignore` 中排除 |
+
+## 发布新版本（作者用）
+
+1. 改好 `uma_bot.py`，把里面的 `VERSION = "x.y"` 调大。
+2. 运行 `python make_release.py "这次更新了什么"`，会生成 `version.json`（含版本号、更新内容和校验码）。
+3. 把 `uma_bot.py` 和 `version.json` 一起上传到 GitHub 的 `main` 分支。
+
+用户下次打开程序就会收到更新提示。程序会先连 GitHub，连不上再改用 jsDelivr 镜像（镜像可能晚几分钟到几小时才同步）。下载的文件要校验码一致、而且能正常编译才会替换，旧版会备份到 `app\backup\`；新版万一打不开，启动器会自动退回 exe 内附的版本。
+
+> 如果新版本用到了新的 Python 库，旧 exe 里没有打包，就需要重新运行 `build.bat`。
 
 ## 打赏与反馈
 

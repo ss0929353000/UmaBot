@@ -48,7 +48,7 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.0"
+VERSION = "3.2"
 SUBTITLE = "by-Yung"
 FEEDBACK_EMAIL = "363111444@qq.com"
 FONT = "Microsoft YaHei UI"
@@ -58,6 +58,17 @@ TPL_DIR = os.path.join(BASE, "templates")
 CFG_PATH = os.path.join(BASE, "config.json")
 FANS_PATH = os.path.join(BASE, "fans.json")
 JEWEL_RESET_HOUR = 4  # 萝卜的「一天」从凌晨 4 点算起（和游戏每日刷新一致）
+
+# ---- 自动更新：从 GitHub 拉新版 ----
+UPDATE_REPO = "ss0929353000/UmaBot"
+UPDATE_BRANCH = "main"
+UPDATE_MIRRORS = [  # 国内直连 GitHub 常常连不上，依序换下一个来源
+    "https://raw.githubusercontent.com/{repo}/{branch}/{path}",
+    "https://cdn.jsdelivr.net/gh/{repo}@{branch}/{path}",
+    "https://fastly.jsdelivr.net/gh/{repo}@{branch}/{path}",
+]
+# 程序代码所在位置：exe 版是 exe 旁边 app 文件夹里的 uma_bot.py（由启动器载入），更新就是换掉这个文件
+CODE_PATH = os.path.abspath(globals().get("__file__") or sys.argv[0])
 STATE_PATH = os.path.join(BASE, "state.json")
 
 
@@ -117,6 +128,7 @@ TEMPLATE_GROUPS = [
         "end_close": "赛马娘信息的「关闭」",
         "end_again": "「再次育成」",
         "end_fans": "获得奖励里的「获得粉丝总数」标题（用来记录粉丝数）",
+        "err_3d": "错误弹窗里的「3D资源读取失败。」文字（看到就关游戏重开）",
         "end_next": "领奖画面的「下项」（左半边，避开闪光圈）",
         "end_next_b": "结算画面的「下项」（左半边，避开闪光圈）",
     }),
@@ -179,6 +191,7 @@ DEFAULT_CFG = {
     "tp_max_drinks": 2,
     "tp_use_jewel": False,     # 体力饮料用完时用宝石回复
     "tp_max_jewel": 1,
+    "tp_stop_when_out": True,  # 体力饮料（和宝石）次数用完、TP 还是不够时，整个停止，不再开新一轮
     "story_max_episodes": 0,
     "story_max_scroll": 5,
     "story_new_region": None,
@@ -189,6 +202,7 @@ DEFAULT_CFG = {
     "capture_size": None,
     "custom_templates": {},
     "fan_reset_hour": 0,
+    "auto_update": True,       # 打开程序时检查 GitHub 上有没有新版本
 }
 
 # 配色：里见家的祖母绿、金色与象牙白
@@ -395,22 +409,38 @@ def process_name(pid):
 
 
 def find_uu_window():
-    """找 UU 加速器的主窗口（最大的那个可见窗口）。"""
+    """找 UU 加速器的主窗口。UU 还有托盘、加速状态栏、透明的全屏小窗口，要排除掉：
+    只要横向、长宽比像主窗口（约 1.45）、不是工具窗口的那个。"""
     best = None
+    try:
+        sw = win32api.GetSystemMetrics(78) or 1920   # 虚拟桌面宽
+        sh = win32api.GetSystemMetrics(79) or 1080
+    except Exception:
+        sw, sh = 1920, 1080
 
     def cb(h, _):
         nonlocal best
         try:
-            if not win32gui.IsWindowVisible(h):
+            if not win32gui.IsWindowVisible(h) or win32gui.IsIconic(h):
                 return
             title = win32gui.GetWindowText(h)
             pid = win32process.GetWindowThreadProcessId(h)[1]
             name = process_name(pid)
             if not (name.startswith("uu") or "UU加速器" in title or "网易UU" in title):
                 return
+            ex = win32gui.GetWindowLong(h, -20)  # GWL_EXSTYLE
+            if ex & 0x80 or ex & 0x20:  # WS_EX_TOOLWINDOW / WS_EX_TRANSPARENT
+                return
             l, t, r, b = win32gui.GetWindowRect(h)
-            area = (r - l) * (b - t)
-            if r - l > 400 and b - t > 300 and (best is None or area > best[0]):
+            w, hh = r - l, b - t
+            if w < 600 or hh < 400 or l < -20000 or t < -20000:
+                return
+            if not (1.25 <= w / hh <= 1.75):  # 全屏的透明窗口、长条状态栏都不是
+                return
+            if w >= sw * 0.98 and hh >= sh * 0.9:
+                return
+            area = w * hh
+            if best is None or area > best[0]:
                 best = (area, h)
         except Exception:
             pass
@@ -419,7 +449,26 @@ def find_uu_window():
         win32gui.EnumWindows(cb, None)
     except Exception:
         pass
-    return best[1] if best else None
+    if best:
+        return best[1]
+    # 最小化在任务栏时上面会被跳过：再找一次（之后会被 show_window 还原）
+    found = []
+
+    def cb2(h, _):
+        try:
+            if win32gui.IsWindowVisible(h) and win32gui.IsIconic(h):
+                title = win32gui.GetWindowText(h)
+                name = process_name(win32process.GetWindowThreadProcessId(h)[1])
+                if name.startswith("uu") or "UU加速器" in title or "网易UU" in title:
+                    found.append(h)
+        except Exception:
+            pass
+
+    try:
+        win32gui.EnumWindows(cb2, None)
+    except Exception:
+        pass
+    return found[0] if found else None
 
 
 def show_window(hwnd):
@@ -432,7 +481,20 @@ def show_window(hwnd):
 
 
 # UU 窗口里的相对位置（从你录的影片量出来的；UU 窗口的版面固定，只会跟着缩放）
-UU_REL = {"tile": (0.169, 0.324), "start": (0.105, 0.477)}
+UU_REL = {"cover": (0.147, 0.37), "tile": (0.147, 0.553), "label": (0.147, 0.642), "start": (0.105, 0.477)}
+UU_SETTLE = 10   # 详情页出现后等几秒再点「启动游戏」
+UU_TPL_W = 896   # 内附的 UU 模板是在 UU 窗口宽 896 像素时截的，用来预估缩放
+
+
+class GameBroken(Exception):
+    """游戏出错（3D 资源读取失败、未响应），需要关掉重开。"""
+
+
+def is_hung(hwnd):
+    try:
+        return bool(ctypes.windll.user32.IsHungAppWindow(hwnd))
+    except Exception:
+        return False
 
 
 def is_foreground(hwnd):
@@ -727,12 +789,16 @@ class Bot(threading.Thread):
         self.state_text = None
         self.last_box = {}
         self.launched_once = False
+        self.hung_since = None
+        self.recoveries = 0
         self.next_label = "下次执行"
         self.uu_scale = None
+        self.last_match = None
         self.screen_scale = {}
         self.screen_best = {}
         self.screen_last = {}
         self.screen_black = False
+        self.last_screen = None
         self.f = 1.0
         self.full = None
         self.last_small = None
@@ -743,6 +809,7 @@ class Bot(threading.Thread):
         self.jewel_best = 0.0
         self.jewel_prev = None
         self.cycles = 0
+        self.tp_out = None    # 这一轮因为体力回复次数用完而开不了时，记下原因
         self.story_count = 0
         self.scrolls = 0
 
@@ -916,16 +983,71 @@ class Bot(threading.Thread):
     def countdown(self, minutes):
         return self.countdown_until(time.time() + minutes * 60)
 
+    def broken_reason(self, img=None, full=None):
+        """检查游戏是不是坏了：3D 资源读取失败的弹窗，或窗口「未响应」超过 40 秒。"""
+        hwnd = find_window(self.cfg["window_title"])
+        if not hwnd:
+            self.hung_since = None
+            return None
+        if is_hung(hwnd):
+            self.hung_since = self.hung_since or time.time()
+            if time.time() - self.hung_since > 40:
+                return "游戏「未响应」超过 40 秒"
+        else:
+            self.hung_since = None
+        tpl = self.tpls.get("err_3d")
+        if tpl is not None:
+            if img is None and not win32gui.IsIconic(hwnd):
+                try:
+                    full = grab(client_rect(hwnd))
+                    h = full.shape[0]
+                    f = min(1.0, WORK_H / h)
+                    img = cv2.resize(full, (round(full.shape[1] * f), round(h * f)), interpolation=cv2.INTER_AREA)
+                except Exception:
+                    img = None
+            if img is not None and tpl.shape[0] <= img.shape[0] and tpl.shape[1] <= img.shape[1]:
+                g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                t = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)  # 灰阶：窗口变白（未响应）时也认得出
+                if float(cv2.matchTemplate(g, t, cv2.TM_CCOEFF_NORMED).max()) >= 0.85:
+                    return "出现「3D资源读取失败」"
+        return None
+
+    def recover_game(self, reason):
+        """关掉坏掉的游戏，用 DMM 快捷方式（没填就走加速器）重新打开，等它进到主页。"""
+        self.recoveries += 1
+        self.log(f"{reason}，关闭游戏后重新启动（本次运行第 {self.recoveries} 次）", "warn")
+        self.save_debug_shot()
+        self.close_game()
+        self.wait(5)
+        game = self.cfg.get("game_path", "")
+        if game and os.path.exists(game):
+            self.state_text = "正在重新启动游戏…"
+            self.log("用 DMM 快捷方式重新打开游戏")
+            try:
+                os.startfile(game)
+            except OSError as e:
+                self.log(f"打开 DMM 快捷方式失败：{e}", "err")
+                self.state_text = None
+                return False
+            return self.wait_game_ready()
+        return self.launch_game()
+
     def countdown_until(self, end, what="执行"):
         if end <= time.time():
             return True
         self.next_run = end
         self.next_label = f"下次{what}"
         self.log(f"下次{what}时间 {time.strftime('%H:%M:%S', time.localtime(end))}")
+        last_check = time.time()
         while not self.stop_evt.is_set():
             if time.time() >= end:
                 self.next_run = None
                 return True
+            if time.time() - last_check > 30:  # 等待期间也每 30 秒看一次游戏有没有出错
+                last_check = time.time()
+                r = self.broken_reason()
+                if r and self.recoveries < 10:
+                    self.recover_game(r)
             self.wait(min(end - time.time(), 1))
         return False
 
@@ -1062,11 +1184,21 @@ class Bot(threading.Thread):
 
     def restart_auto(self):
         self.clear_desktop()
+        self.tp_out = None
         self.result = {"gain": None, "jewels_before": None, "jewels_after": None}
         self.jewel_prev = None
         self.jewel_best = 0.0
         try:
-            return self._restart_auto()
+            try:
+                return self._restart_auto()
+            except GameBroken as e:
+                if self.recoveries >= 10 or not self.recover_game(str(e)):
+                    return False
+                self.log("游戏已重新打开，重新执行这一轮", "ok")
+                return self._restart_auto()
+        except GameBroken as e:
+            self.log(f"{e}，这一轮放弃，下个周期再试", "warn")
+            return False
         finally:
             r = self.result
             jewels = None
@@ -1127,6 +1259,9 @@ class Bot(threading.Thread):
             if img is None:
                 self.log("游戏窗口不见了", "err")
                 return False
+            r = self.broken_reason(img)
+            if r:
+                raise GameBroken(r)
 
             # 宝石：领奖之前看到的算「开始前」，领奖之后看到的算「结束后」
             if "flow_jewel" in self.tpls:
@@ -1171,7 +1306,8 @@ class Bot(threading.Thread):
                     pt = None if no_drink else self.find_drink_use(img)
                     if pt:
                         if drinks >= self.cfg["tp_max_drinks"]:
-                            self.log(f"这一轮已经喝了 {drinks} 瓶，达到上限，先停在这里", "warn")
+                            self.tp_out = f"本轮已经喝了 {drinks} 瓶体力饮料，达到上限，TP 还是不够"
+                            self.log(self.tp_out, "warn")
                             return False
                         drinks += 1
                         if not self.click(pt, f"使用体力饮料（本轮第 {drinks} 瓶）"):
@@ -1196,10 +1332,12 @@ class Bot(threading.Thread):
                         break
                     if jewel_seen >= 3:
                         if not self.cfg.get("tp_use_jewel"):
-                            self.log("体力饮料用完了，而且没开「饮料用完时用宝石回复」，先停在这里", "warn")
+                            self.tp_out = "体力饮料用完了，而且没开「饮料用完时用宝石回复」"
+                            self.log(self.tp_out, "warn")
                             return False
                         if jewel_uses >= self.cfg.get("tp_max_jewel", 1):
-                            self.log(f"这一轮已经用宝石回复 {jewel_uses} 次，达到上限，先停在这里", "warn")
+                            self.tp_out = f"本轮已经用宝石回复 {jewel_uses} 次，达到上限，TP 还是不够"
+                            self.log(self.tp_out, "warn")
                             return False
                         pt = self.find_row_use(img, "flow_tp_jewel")
                         if pt:
@@ -1231,7 +1369,8 @@ class Bot(threading.Thread):
                 if not pt:
                     continue
                 if key == "flow_tp_recover" and not self.cfg["tp_auto_drink"]:
-                    self.log("TP 不足，而且没开「自动喝体力饮料」，先停在这里", "warn")
+                    self.tp_out = "TP 不足，而且没开「自动喝体力饮料」"
+                    self.log(self.tp_out, "warn")
                     return False
                 changed = self.click(pt, label)
                 clicked.add(key)
@@ -1287,6 +1426,11 @@ class Bot(threading.Thread):
             ok = self.restart_auto()
             if ok:
                 self.log("新的自动育成已开始，已回到主页", "ok")
+            elif self.tp_out and self.cfg.get("tp_stop_when_out", True) and not self.stop_evt.is_set():
+                self.log(f"体力回复次数用完了（{self.tp_out}），已停止，不再开新一轮", "err")
+                self.state_text = "体力用完，已停止"
+                self.stop_evt.set()
+                return
             elif not self.stop_evt.is_set():
                 self.save_debug_shot()
                 self.log("这次没重开成功，游戏先不关，下个周期再试", "warn")
@@ -1311,13 +1455,16 @@ class Bot(threading.Thread):
     # ---- 自动启动 / 关闭游戏 ----
     SCREEN_SCALES = [1.0, 0.9, 1.1, 0.8, 1.25, 0.75, 1.33, 0.67, 1.5, 0.6, 1.75, 0.5, 2.0, 0.4, 2.5, 0.33]
 
-    def find_on_screen(self, key, thr=0.75):
-        """在整个桌面找加速器的按钮。每个按钮各自记住合适的缩放；先在半尺寸画面上找，速度快很多。"""
+    def find_on_screen(self, key, thr=0.75, region=None, color=False, est=None):
+        """在桌面（或只在 region=(左,上,右,下) 这块范围里）找按钮。
+        color=True 用彩色比对（小按钮用灰阶很容易跟背景图「很像」）；est 是预估的缩放。
+        粗找一遍后，会在最像的缩放附近再细找，文字类模板对缩放很敏感。"""
         path = tpl_path(key)
         tpl = cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_COLOR) if os.path.exists(path) else None
         if tpl is None:
             return None
         img, left, top = grab_screen()
+        self.last_screen = (img, left, top)
         self.screen_black = float(img.std()) < 4  # 远程桌面最小化或断开时，截到的是全黑画面
         img = img.copy()
         for h_ in own_windows():
@@ -1326,19 +1473,49 @@ class Bot(threading.Thread):
                 img[max(0, t_ - top):max(0, b - top), max(0, l - left):max(0, r - left)] = 0
             except Exception:
                 pass
-        small = cv2.cvtColor(cv2.resize(img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
-        tpl = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)
+        ox, oy = left, top
+        if region:
+            l, t_, r, b = region
+            x0, y0 = max(0, l - left), max(0, t_ - top)
+            x1, y1 = min(img.shape[1], r - left), min(img.shape[0], b - top)
+            if x1 - x0 < 50 or y1 - y0 < 50:
+                return None
+            img = img[y0:y1, x0:x1]
+            ox, oy = left + x0, top + y0
+        if not color:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            tpl = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+
+        def match(sc):
+            # 模板缩小后至少要有 18 像素高，太小的话随便一块都很像；按钮小就在原尺寸画面上找
+            half = tpl.shape[0] * sc * 0.5 >= 18 and tpl.shape[1] * sc * 0.5 >= 18
+            canvas, k = (small, 0.5) if half else (img, 1.0)
+            t = cv2.resize(tpl, None, fx=sc * k, fy=sc * k, interpolation=cv2.INTER_AREA if sc * k < 1 else cv2.INTER_LINEAR)
+            if t.shape[0] < 16 or t.shape[1] < 16 or t.shape[0] > canvas.shape[0] or t.shape[1] > canvas.shape[1]:
+                return None
+            _, mx, _, loc = cv2.minMaxLoc(cv2.matchTemplate(canvas, t, cv2.TM_CCOEFF_NORMED))
+            w, h = t.shape[1] / k, t.shape[0] / k
+            return mx, sc, (int(ox + loc[0] / k + w / 2), int(oy + loc[1] / k + h / 2)), (int(w), int(h))
+
         known = self.screen_scale.get(key)
-        scales = [known] if known else self.SCREEN_SCALES
+        scales = []
+        if known:
+            scales.append(known)
+        if est:
+            scales += [est * (1 + d / 100) for d in range(-8, 9, 2)]
+        if not scales:
+            scales = list(self.SCREEN_SCALES)
         best = None
         for sc in scales:
-            f = sc * 0.5
-            t = cv2.resize(tpl, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
-            if t.shape[0] < 6 or t.shape[1] < 6 or t.shape[0] > small.shape[0] or t.shape[1] > small.shape[1]:
-                continue
-            _, mx, _, loc = cv2.minMaxLoc(cv2.matchTemplate(small, t, cv2.TM_CCOEFF_NORMED))
-            if best is None or mx > best[0]:
-                best = (mx, sc, loc, t.shape)
+            m = match(sc)
+            if m and (best is None or m[0] > best[0]):
+                best = m
+        if best is not None and not known:
+            for d in (-0.045, -0.03, -0.015, 0.015, 0.03, 0.045):  # 在最像的缩放附近细找
+                m = match(best[1] * (1 + d))
+                if m and m[0] > best[0]:
+                    best = m
         if best is None:
             return None
         self.screen_best[key] = max(self.screen_best.get(key, 0), best[0])
@@ -1349,10 +1526,17 @@ class Bot(threading.Thread):
             return None
         self.screen_scale[key] = best[1]
         self.uu_scale = best[1]
-        (x, y), (h, w) = best[2], best[3][:2]
-        pt = left + (x + w // 2) * 2, top + (y + h // 2) * 2
-        self.last_box[pt] = (w * 2, h * 2)
+        pt = best[2]
+        self.last_box[pt] = best[3]
+        self.last_match = best
         return pt
+
+    def hover_click_screen(self, pt, label, hover=1.2):
+        """先把鼠标移到上面停一下（UU 封面要悬停才会出现「立即加速」），再点。"""
+        pyautogui.moveTo(pt[0], pt[1], duration=random.uniform(0.15, 0.35))
+        self.wait(hover)
+        self.last_box[pt] = (24, 16)
+        self.click_screen(pt, label)
 
     def click_screen(self, pt, label):
         on = self.cfg.get("humanize", True)
@@ -1377,6 +1561,20 @@ class Bot(threading.Thread):
                     return False
                 self.wait(1.5)
         return not self.stop_evt.is_set()
+
+    def is_cyan_button(self, pt):
+        """「启动游戏」按钮是青绿色的；认到的位置要真的是这个颜色才算。"""
+        if not self.last_screen:
+            return False
+        img, left, top = self.last_screen
+        w, h = self.last_box.get(pt, (60, 20))
+        x, y = pt[0] - left, pt[1] - top
+        reg = img[max(0, y - h // 3):y + h // 3, max(0, x - w // 3):x + w // 3]
+        if reg.size == 0:
+            return False
+        hsv = cv2.cvtColor(reg, cv2.COLOR_BGR2HSV)
+        m = (hsv[..., 0] >= 78) & (hsv[..., 0] <= 102) & (hsv[..., 1] > 70) & (hsv[..., 2] > 110)
+        return float(m.mean()) > 0.35
 
     def wait_game_started(self, secs):
         """点了启动后，看游戏有没有真的开始启动（游戏窗口或游戏程序出现）。"""
@@ -1404,37 +1602,183 @@ class Bot(threading.Thread):
         except Exception:
             pass
 
-    def launch_by_uu(self):
-        """UU 加速器：点封面开始加速，再点「启动游戏」。"""
-        deadline = time.time() + 240
-        last_report = time.time()
-        began = time.time()
-        tile_at = 0.0   # 上次点封面的时间
-        start_clicks = 0
-        rel_used = False
-
-        def rel_point(name):
-            hw = find_uu_window()
-            if not hw:
-                return None
-            show_window(hw)
-            self.wait(0.8)
-            l, t, r, b = win32gui.GetWindowRect(hw)
-            rx, ry = UU_REL[name]
-            return int(l + (r - l) * rx), int(t + (b - t) * ry)
-
+    # ---- UU 加速器 ----
+    def uu_locate(self, bring_front=False):
+        """回传 (UU 主窗口范围, 预估缩放)；找不到 UU 窗口就回传 (None, None)。"""
         hw = find_uu_window()
-        if hw:
-            show_window(hw)  # 远程控制时 UU 常被挡住或缩在托盘：先把它叫到最前面
-            self.wait(1)
+        if not hw:
+            return None, None
+        if bring_front or win32gui.IsIconic(hw):
+            show_window(hw)  # 远程控制时 UU 常被挡住或缩在任务栏：先叫到最前面
+            self.wait(0.8)
+            hw = find_uu_window() or hw
+        try:
+            l, t, r, b = win32gui.GetWindowRect(hw)
+        except Exception:
+            return None, None
+        if r - l < 600 or b - t < 400:
+            return None, None
+        return (l, t, r, b), (r - l) / UU_TPL_W
+
+    def uu_find(self, key, region, est, thr):
+        """只在 UU 窗口里、用彩色比对找；找不到 UU 窗口才找整个桌面（门槛更高）。"""
+        if region:
+            pt = self.find_on_screen(key, thr=thr, region=region, color=True, est=est)
+            if not pt and est:
+                pt = self.find_on_screen(key, thr=thr, region=region, color=True)
+            return pt
+        return self.find_on_screen(key, thr=min(0.92, thr + 0.1), color=True)
+
+    def uu_find_start(self, region, est):
+        """详情页里青色的「启动游戏」按钮。"""
+        pt = self.uu_find("uu_start", region, est, 0.85)
+        if pt and not self.is_cyan_button(pt):
+            return None
+        return pt
+
+    def uu_cover(self, region, est):
+        """找首页上赛马娘的封面。回传 dict：封面中心、预估的「立即加速」位置、文字位置、尺寸 W；找不到回传 None。"""
+        pt = self.uu_find("uu_tile", region, est, 0.72)
+        if pt and self.last_match:
+            w, h = self.last_match[3]
+            if region and w > h * 3 and (pt[1] - region[1]) < (region[3] - region[1]) * 0.55:
+                return {"detail": True}   # 文字在窗口上半部：这是加速详情页里的小封面，不是首页
+            if w > h * 3:   # 截的是「赛马娘Pretty Derby」这行字（内附模板就是这个）
+                W = w
+                return {"cover": (pt[0], int(pt[1] - 1.14 * W)), "accel": (pt[0], int(pt[1] - 0.39 * W)),
+                        "label": pt, "W": W, "how": "认出封面下的文字"}
+            # 截的是封面图本身
+            W = w / 1.33
+            return {"cover": pt, "accel": (pt[0], int(pt[1] + 0.39 * h)),
+                    "label": (pt[0], int(pt[1] + 0.58 * h)), "W": W, "how": "认出封面图"}
+        if region:  # 认不出来：用 UU 窗口里的固定位置（UU 首页版面固定，只会跟着缩放）
+            l, t, r, b = region
+            ww, wh = r - l, b - t
+
+            def rp(n):
+                return int(l + ww * UU_REL[n][0]), int(t + wh * UU_REL[n][1])
+            return {"cover": rp("cover"), "accel": rp("tile"), "label": rp("label"), "W": ww * 0.165,
+                    "how": "按 UU 窗口里的固定位置"}
+        return None
+
+    def cyan_text_at(self, c):
+        """悬停后封面下半部会出现青色的「立即加速 →」：找出它的位置（去掉封面青色的外框线）。"""
+        img, left, top = grab_screen()
+        lx, ly, W = c["label"][0] - left, c["label"][1] - top, c["W"]
+        x0, x1 = max(0, int(lx - 0.5 * W)), max(0, int(lx + 0.55 * W))
+        y0, y1 = max(0, int(ly - 0.8 * W)), max(0, int(ly - 0.03 * W))
+        reg = img[y0:y1, x0:x1]
+        if reg.size == 0:
+            return None
+        hsv = cv2.cvtColor(reg, cv2.COLOR_BGR2HSV)
+        m = ((hsv[..., 0] >= 78) & (hsv[..., 0] <= 102) & (hsv[..., 1] > 70) & (hsv[..., 2] > 110)).astype(np.uint8)
+        m[m.sum(1) > m.shape[1] * 0.6, :] = 0   # 横的外框线
+        m[:, m.sum(0) > m.shape[0] * 0.5] = 0   # 竖的外框线
+        rows = m.sum(1)
+        # 找最大的一段连续有青色的行：那就是「立即加速」这行字
+        best, cur, start = (0, 0, 0), 0, 0
+        for i, v in enumerate(list(rows) + [0]):
+            if v >= 2:
+                if cur == 0:
+                    start = i
+                cur += int(v)
+            else:
+                if cur > best[0]:
+                    best = (cur, start, i)
+                cur = 0
+        if best[0] < max(40, int(W * W * 0.0012)):
+            return None
+        band = m[best[1]:best[2]]
+        ys, xs = np.nonzero(band)
+        return int(left + x0 + np.median(xs)), int(top + y0 + best[1] + np.median(ys))
+
+    def cover_brightness(self, c):
+        img, left, top = grab_screen()
+        x, y, W = c["cover"][0] - left, c["cover"][1] - top, c["W"]
+        reg = img[max(0, int(y - 0.75 * W)):max(0, int(y + 0.75 * W)), max(0, int(x - 0.55 * W)):max(0, int(x + 0.55 * W))]
+        return float(cv2.cvtColor(reg, cv2.COLOR_BGR2GRAY).mean()) if reg.size else 0.0
+
+    def uu_accelerate(self, region, est, n):
+        """悬停在封面上 → 点出现的「立即加速」→ 确认 UU 真的开始加速。
+        回传 None＝首页上找不到封面；True＝已开始加速；False＝点了但没反应。"""
+        c = self.uu_cover(region, est)
+        if not c:
+            return None
+        if c.get("detail"):
+            return "detail"
+        if n == 1:
+            self.log(f"UU：{c['how']}，封面在 ({c['cover'][0]}, {c['cover'][1]})"
+                     + (f"；UU 窗口 {region[2] - region[0]}×{region[3] - region[1]}" if region else "；没找到 UU 窗口，在整个桌面找"))
+        base = self.cover_brightness(c)
+        # 慢慢移到封面上，停够久让「立即加速」的动画完全滑出来，而且位置要两次一样才算稳定
+        pyautogui.moveTo(c["cover"][0], c["cover"][1], duration=random.uniform(0.6, 1.0), tween=pyautogui.easeOutQuad)
+        self.wait(2.5)
+        acc, prev = None, None
+        for _ in range(6):
+            p = self.cyan_text_at(c)
+            if p and prev and abs(p[0] - prev[0]) < c["W"] * 0.04 and abs(p[1] - prev[1]) < c["W"] * 0.04:
+                acc = p
+                break
+            prev = p
+            self.wait(0.7)
+        if acc:
+            self.log("鼠标悬停在封面上，看到了「立即加速」")
+        else:
+            acc = prev or c["accel"]
+            self.log("悬停后没等到稳定的「立即加速」字样，按位置点封面下方", "warn")
+        # 先移到字上停一下再点，不要一移过去就点
+        pyautogui.moveTo(acc[0], acc[1], duration=random.uniform(0.4, 0.7), tween=pyautogui.easeOutQuad)
+        self.wait(random.uniform(0.6, 1.0))
+        self.last_box[acc] = (int(c["W"] * 0.3), int(c["W"] * 0.06))
+        self.click_screen(acc, f"UU：立即加速（第 {n} 次）")
+        self.save_click_shot(acc, "uu_tile")
+        self.wait(1.5)
+        # 把鼠标移开（停在封面上会一直是悬停的样子），再看封面有没有变暗转圈 / 换成详情页
+        pyautogui.moveTo(c["label"][0], int(c["label"][1] + 0.22 * c["W"]), duration=random.uniform(0.5, 0.8))
+        end = time.time() + 12
+        while time.time() < end and not self.stop_evt.is_set():
+            self.wait(1.5)
+            if self.uu_find_start(region, est):
+                return True
+            now = self.cover_brightness(c)
+            if base > 20 and now < base * 0.6:
+                return True    # 封面变暗、出现转圈：加速中
+            lp = self.uu_find("uu_tile", region, est, 0.72)
+            if not lp or (region and (lp[1] - region[1]) < (region[3] - region[1]) * 0.55) or abs(lp[0] - c["label"][0]) > c["W"] * 0.3 or abs(lp[1] - c["label"][1]) > c["W"] * 0.3:
+                if c["how"].startswith("认出"):
+                    return True    # 首页的封面不见了：已经换到加速详情页
+        return False
+
+    def launch_by_uu(self):
+        """UU 加速器：悬停封面 → 点「立即加速」→ 确认开始加速 → 点青色的「启动游戏」。"""
+        deadline = time.time() + 300
+        last_report = time.time()
+        accel_ok = False
+        accel_at = 0.0
+        tries = 0
+        start_clicks = 0
+        last_rel = 0.0
+        last_front = 0.0
+        start_seen = 0.0
         while time.time() < deadline and not self.stop_evt.is_set():
-            pt = self.find_on_screen("uu_start", thr=0.88)
-            if pt and not tile_at and self.screen_last.get("uu_start", 0) < 0.93:
-                pt = None  # 还没点封面加速，又不是非常像：多半认错了
+            front = time.time() - last_front > 20
+            region, est = self.uu_locate(bring_front=front)
+            if front:
+                last_front = time.time()
+            # 1) 已经在加速详情页：点「启动游戏」
+            pt = self.uu_find_start(region, est)
+            if pt and not start_seen:
+                start_seen = time.time()
+                self.log(f"UU 已连上加速，先等 {UU_SETTLE} 秒让加速稳定再点「启动游戏」")
+                self.state_text = "UU 加速中，等它稳定…"
+            if pt and time.time() - start_seen < UU_SETTLE:
+                self.wait(1)    # 加速刚开始就点「启动游戏」常会失败：等加速稳定
+                continue
             if pt:
-                # 详情页刚滑进来、加速刚连上时按钮可能还没反应：先等一下再确认位置
-                self.wait(2)
-                pt = self.find_on_screen("uu_start", thr=0.88) or pt
+                p2 = self.uu_find_start(region, est)
+                pt = p2 or pt
+                pyautogui.moveTo(pt[0], pt[1], duration=random.uniform(0.4, 0.7), tween=pyautogui.easeOutQuad)
+                self.wait(random.uniform(0.6, 1.0))
                 start_clicks += 1
                 self.click_screen(pt, f"UU：启动游戏（第 {start_clicks} 次）")
                 self.save_click_shot(pt, "uu_start")
@@ -1442,16 +1786,46 @@ class Bot(threading.Thread):
                 if self.wait_game_started(45):
                     self.log("游戏已开始启动", "ok")
                     return True
+                if self.stop_evt.is_set():
+                    return False
                 if start_clicks >= 3:
                     self.log("点了 3 次「启动游戏」游戏都没开。debug 文件夹里有点击位置的截图，可以发给作者看", "warn")
                     return False
                 self.log("点了「启动游戏」45 秒都没看到游戏启动，再点一次", "warn")
                 continue
-            # 认不出「启动游戏」：加速 12 秒后改用固定位置点
-            if not pt and tile_at and time.time() - tile_at > 12 and start_clicks < 3 \
-                    and (rel_used or time.time() - tile_at > 30):
-                rp = rel_point("start")
-                if rp:
+            # 2) 还没加速：悬停封面、点「立即加速」
+            if not accel_ok:
+                if time.time() - accel_at < 8:
+                    self.wait(1)
+                    continue
+                if tries >= 4:
+                    self.log("试了 4 次「立即加速」UU 都没开始加速。debug 文件夹里有 click_uu_tile 截图（红圈是点击位置），"
+                             "可以发给作者看", "err")
+                    return False
+                self.state_text = "UU：点「立即加速」…"
+                r = self.uu_accelerate(region, est, tries + 1)
+                if r == "detail":
+                    accel_ok = True
+                    accel_at = time.time()
+                    self.log("UU 已经在加速详情页了，等「启动游戏」按钮", "ok")
+                    continue
+                if r is not None:
+                    tries += 1
+                    accel_at = time.time()
+                    if r:
+                        accel_ok = True
+                        self.log("UU 已开始加速，等「启动游戏」按钮出现", "ok")
+                        self.state_text = "UU 正在加速…"
+                    else:
+                        self.log("点了「立即加速」12 秒 UU 都没反应，再试一次", "warn")
+                    continue
+            else:
+                waited = time.time() - accel_at
+                # 3) 加速了 25 秒还认不出「启动游戏」：按 UU 窗口里的固定位置点
+                if waited > 35 and region and start_clicks < 3 and time.time() - last_rel > 50:
+                    l, t, r_, b = region
+                    rp = int(l + (r_ - l) * UU_REL["start"][0]), int(t + (b - t) * UU_REL["start"][1])
+                    last_rel = time.time()
                     start_clicks += 1
                     self.log("认不出「启动游戏」按钮，改用 UU 窗口里的固定位置点击", "warn")
                     self.last_box[rp] = (40, 14)
@@ -1462,41 +1836,25 @@ class Bot(threading.Thread):
                         self.log("游戏已开始启动", "ok")
                         return True
                     continue
-            # 点了封面后 UU 要转圈加速几秒，期间封面还在，不能再点（再点会取消加速）
-            if time.time() - tile_at < 25:
-                self.state_text = "UU 正在加速，等「启动游戏」出现…"
-                self.wait(1)
-                continue
-            pt = self.find_on_screen("uu_tile")
-            if not pt and not tile_at and time.time() - began > 25:
-                # 25 秒都认不出封面（远程分辨率、颜色变了）：改用 UU 窗口里的固定位置
-                pt = rel_point("tile")
-                if pt:
-                    rel_used = True
-                    self.log("认不出封面图，改用 UU 窗口里的固定位置点击", "warn")
-                    self.last_box[pt] = (60, 60)
-                    self.click_screen(pt, "UU：赛马娘封面（按窗口位置）")
-                    self.save_click_shot(pt, "uu_tile")
-                    tile_at = time.time()
-                    self.wait(3)
-                    continue
-            if pt:
-                t = cv2.imdecode(np.fromfile(tpl_path("uu_tile"), np.uint8), cv2.IMREAD_COLOR)
-                if t is not None and t.shape[1] > t.shape[0] * 3:
-                    # 截的是「赛马娘Pretty Derby」文字：点它正上方的封面图（约 165 像素 × 缩放）
-                    pt = (pt[0], pt[1] - int(165 * self.screen_scale.get("uu_tile", 1.0)))
-                self.click_screen(pt, "UU：赛马娘封面（立即加速）")
-                tile_at = time.time()
-                self.wait(3)
-                continue
-            if time.time() > last_report + 15 and self.screen_black:
+                # 加速 40 秒后首页封面又是正常的样子：刚才其实没加速成功，重来
+                if waited > 90 and not region:
+                    accel_ok = False
+                elif waited > 40:
+                    c = self.uu_cover(region, est)
+                    if c and not c.get("detail") and c["how"].startswith("认出") and self.cyan_text_at(c) is None \
+                            and abs(c["label"][1] - (region[1] + (region[3] - region[1]) * UU_REL["label"][1])) < c["W"]:
+                        self.log("UU 好像没有在加速（首页封面又出现了），重新点「立即加速」", "warn")
+                        accel_ok = False
+            if time.time() > last_report + 15:
                 last_report = time.time()
-                self.log("截到的桌面是全黑的：远程桌面窗口被最小化或断开时，Windows 不会画画面，程序看不到也点不了。"
-                         "请让远程窗口保持打开（不要最小化）", "err")
-            elif time.time() > last_report + 15:
-                last_report = time.time()
-                self.log("还在找加速器里的按钮（最像的：" + "、".join(
-                    f"{k} {v:.2f}" for k, v in self.screen_best.items()) + "）。确认加速器窗口没被挡住", "warn")
+                if self.screen_black:
+                    self.log("截到的桌面是全黑的：远程桌面窗口被最小化或断开时，Windows 不会画画面，程序看不到也点不了。"
+                             "请让远程窗口保持打开（不要最小化）", "err")
+                elif not region:
+                    self.log("找不到 UU 加速器的主窗口（是不是缩到托盘了？请把 UU 窗口打开放着）", "warn")
+                else:
+                    self.log("还在找 UU 里的按钮（最像的：" + "、".join(
+                        f"{k} {v:.2f}" for k, v in self.screen_best.items()) + "）。确认 UU 窗口没被挡住", "warn")
             self.wait(1)
         if not self.stop_evt.is_set():
             self.log("UU 加速器里找不到「启动游戏」。不是用 UU 的话，请到「模板」页把你加速器的按钮按顺序加到"
@@ -1554,7 +1912,10 @@ class Bot(threading.Thread):
                 return False
             self.launched_once = True
 
-        # 等游戏窗口出现（DMM 会自己启动游戏）
+        return self.wait_game_ready()
+
+    def wait_game_ready(self):
+        """等游戏窗口出现（DMM 会自己启动游戏），然后点进主页。"""
         end = time.time() + 180
         hwnd = None
         while time.time() < end and not self.stop_evt.is_set():
@@ -1597,6 +1958,12 @@ class Bot(threading.Thread):
             if img is None:
                 self.wait(2)
                 continue
+            r = self.broken_reason(img)
+            if r:
+                if self.recoveries >= 10:
+                    self.log(f"{r}，已经重开太多次，先停在这里", "err")
+                    return False
+                return self.recover_game(r)
             if self.find(img, "flow_home") or self.find(img, "flow_home_running"):
                 self.log("已进入主页", "ok")
                 return True
@@ -1892,6 +2259,45 @@ class ModeEditor(tk.Toplevel):
             self.app.log(f"已建立模式「{name}」。到「模板」页在底部选「模式：{name}」添加步骤并截取", "ok")
 
 
+# ================= 自动更新 =================
+def ver_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:4]) or (0,)
+
+
+def fetch_url(path, timeout=10):
+    """依序从 GitHub / 镜像下载一个文件，回传 bytes；全部失败就抛出最后的错误。"""
+    import urllib.request
+    err = None
+    for m in UPDATE_MIRRORS:
+        url = m.format(repo=UPDATE_REPO, branch=UPDATE_BRANCH, path=path)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "UmaBot-Updater", "Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = r.read()
+            if data:
+                return data
+        except Exception as e:  # 这个来源连不上：换下一个
+            err = e
+    raise err or OSError("下载失败")
+
+
+def can_self_update():
+    """只有 exe 版（启动器 + app 文件夹里的 uma_bot.py）才自己换文件；直接跑源码的话交给 git。"""
+    return bool(getattr(sys, "frozen", False)) and os.path.basename(os.path.dirname(CODE_PATH)).lower() == "app"
+
+
+def restart_program():
+    import subprocess
+    env = os.environ.copy()
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"  # 让新开的 exe 重新解压，不沿用旧进程的临时文件夹
+    env.pop("_MEIPASS2", None)
+    if getattr(sys, "frozen", False):
+        args = [sys.executable]
+    else:
+        args = [sys.executable, CODE_PATH]
+    subprocess.Popen(args, cwd=BASE, env=env, close_fds=True)
+
+
 # ================= 主界面 =================
 class App:
     def __init__(self, root):
@@ -1909,6 +2315,7 @@ class App:
         self.v_tp_max = tk.IntVar(value=self.cfg["tp_max_drinks"])
         self.v_tp_jewel = tk.BooleanVar(value=self.cfg.get("tp_use_jewel", False))
         self.v_tp_jewel_max = tk.IntVar(value=self.cfg.get("tp_max_jewel", 1))
+        self.v_tp_stop = tk.BooleanVar(value=self.cfg.get("tp_stop_when_out", True))
         self.v_story_max = tk.IntVar(value=self.cfg["story_max_episodes"])
         self.v_story_scroll = tk.IntVar(value=self.cfg["story_max_scroll"])
         self.v_title = tk.StringVar(value=self.cfg["window_title"])
@@ -1924,6 +2331,8 @@ class App:
         self.v_dmm_only = tk.BooleanVar(value=self.cfg.get("dmm_only", False))
         self.v_launch_lead = tk.IntVar(value=self.cfg.get("launch_lead", 5))
         self.v_launch_wait = tk.IntVar(value=self.cfg.get("launch_wait", 5))
+        self.v_auto_update = tk.BooleanVar(value=self.cfg.get("auto_update", True))
+        self.updating = False
         self.v_autoscroll = tk.BooleanVar(value=True)
         self.v_prefix = tk.StringVar(value="btn_")
         self.v_custom = tk.StringVar()
@@ -1951,6 +2360,8 @@ class App:
         if pynput_kb:
             pynput_kb.Listener(on_press=self.on_key).start()
         self.log(f"{APP_NAME} v{VERSION} 已就绪")
+        if self.cfg.get("auto_update", True):
+            root.after(2500, lambda: self.check_update(manual=False))
 
     # ---------- 外观 ----------
     def setup_fonts(self):
@@ -2044,6 +2455,8 @@ class App:
                        bootstyle="warning-round-toggle").pack(anchor=W, pady=(6, 0))
         self.row(self.box_cycle, "每轮最多用几次宝石",
                  lambda p: tb.Spinbox(p, from_=0, to=10, textvariable=self.v_tp_jewel_max, width=7))
+        tb.Checkbutton(self.box_cycle, text="回复次数用完就停止，不再开新一轮", variable=self.v_tp_stop,
+                       bootstyle="danger-round-toggle").pack(anchor=W, pady=(6, 0))
         self.box_story = tb.Labelframe(holder, text="剧情", padding=12)
         self.row(self.box_story, "最多看几话（0 为不限）",
                  lambda p: tb.Spinbox(p, from_=0, to=999, textvariable=self.v_story_max, width=7))
@@ -2576,6 +2989,19 @@ class App:
         tb.Button(lb, text="测试：关闭并自动启动一次", bootstyle="info-outline",
                   command=self.test_launch).pack(anchor=W, pady=(8, 0))
 
+        ub = tb.Labelframe(f, text="更新", padding=14)
+        ub.pack(anchor=W, fill=X, pady=(14, 0))
+        ur = tb.Frame(ub)
+        ur.pack(fill=X)
+        tb.Label(ur, text=f"当前版本  v{VERSION}", font=(FONT, 10, "bold")).pack(side=LEFT)
+        self.btn_update = tb.Button(ur, text="检查更新", bootstyle="primary-outline",
+                                    command=lambda: self.check_update(manual=True))
+        self.btn_update.pack(side=LEFT, padx=(12, 0))
+        tb.Checkbutton(ub, text="打开程序时自动检查 GitHub 上有没有新版本",
+                       variable=self.v_auto_update, bootstyle="success-round-toggle",
+                       command=lambda: self.save_settings(quiet=True)).pack(anchor=W, pady=(8, 0))
+        tb.Label(ub, text="更新只会换掉程序代码，设置、模板、粉丝和萝卜记录都会保留", bootstyle="secondary").pack(anchor=W, pady=(4, 0))
+
         tips = tb.Labelframe(f, text="识别不到时", padding=14)
         tips.pack(anchor=W, fill=X, pady=14)
         for t in ("截完模板后，不要再改游戏窗口大小和 Windows 显示缩放。",
@@ -2727,6 +3153,7 @@ class App:
                 tp_max_drinks=int(self.v_tp_max.get()),
                 tp_use_jewel=bool(self.v_tp_jewel.get()),
                 tp_max_jewel=int(self.v_tp_jewel_max.get()),
+                tp_stop_when_out=bool(self.v_tp_stop.get()),
                 story_max_episodes=int(self.v_story_max.get()),
                 story_max_scroll=int(self.v_story_scroll.get()),
                 window_title=self.v_title.get().strip() or "umamusume",
@@ -2742,6 +3169,7 @@ class App:
                 dmm_only=bool(self.v_dmm_only.get()),
                 launch_lead=int(self.v_launch_lead.get()),
                 launch_wait=int(self.v_launch_wait.get()),
+                auto_update=bool(self.v_auto_update.get()),
             )
         except (tk.TclError, ValueError):
             messagebox.showerror(APP_NAME, "有设置项不是有效数字，请检查后再保存")
@@ -3105,6 +3533,120 @@ class App:
             self.fans.changed = False
             self.refresh_fans()
         self.root.after(200, self.poll)
+
+    # ---------- 自动更新 ----------
+    def check_update(self, manual=False):
+        if self.updating:
+            return
+        self.updating = True
+        if manual:
+            self.log("正在检查更新…")
+
+        def work():
+            try:
+                info = json.loads(fetch_url("version.json", timeout=8).decode("utf-8-sig"))
+                self.root.after(0, lambda: self.on_update_info(info, manual))
+            except Exception as e:
+                msg = str(e)
+                self.root.after(0, lambda: self.on_update_fail(f"连不上 GitHub（{msg}）", manual))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update_fail(self, msg, manual):
+        self.updating = False
+        if manual:
+            self.log(f"检查更新失败：{msg}", "warn")
+            messagebox.showwarning(APP_NAME, f"检查更新失败：{msg}\n\n可以稍后再试，或到 GitHub 手动下载。")
+
+    def on_update_info(self, info, manual):
+        new = str(info.get("version", "0"))
+        if ver_tuple(new) <= ver_tuple(VERSION):
+            self.updating = False
+            if manual:
+                self.log(f"已经是最新版本（v{VERSION}）", "ok")
+                messagebox.showinfo(APP_NAME, f"已经是最新版本 v{VERSION}")
+            return
+        notes = str(info.get("notes", "")).strip()
+        self.log(f"发现新版本 v{new}（现在 v{VERSION}）", "ok")
+        if not can_self_update():
+            self.updating = False
+            messagebox.showinfo(APP_NAME, f"发现新版本 v{new}\n\n{notes}\n\n你现在是直接运行源码，请到 GitHub 下载新的 uma_bot.py。")
+            return
+        running = self.bot is not None and self.bot.is_alive()
+        q = f"发现新版本 v{new}（现在 v{VERSION}）\n\n"
+        if notes:
+            q += f"更新内容：\n{notes}\n\n"
+        q += "现在更新吗？更新完会自动重新打开。" + ("\n（正在执行的任务会先停止）" if running else "")
+        if not messagebox.askyesno(APP_NAME, q):
+            self.updating = False
+            return
+        self.stop()
+        self.log(f"正在下载 v{new}…")
+        try:
+            self.btn_update.configure(state=DISABLED)
+        except Exception:
+            pass
+        threading.Thread(target=self.do_update, args=(info,), daemon=True).start()
+
+    def do_update(self, info):
+        """下载 → 检查文件完整、能运行 → 备份旧版 → 换上新版 → 重开程序。"""
+        import hashlib
+        try:
+            new = str(info.get("version", "0"))
+            files = info.get("files") or ["uma_bot.py"]
+            sums = info.get("sha256") or {}
+            got = {}
+            for p in files:
+                p = str(p).replace("\\", "/").lstrip("/")
+                if ".." in p.split("/"):
+                    raise ValueError(f"不安全的路径：{p}")
+                data = fetch_url(p, timeout=30)
+                want = sums.get(p)
+                if want and hashlib.sha256(data).hexdigest().lower() != str(want).lower():
+                    raise ValueError(f"{p} 下载不完整（校验码不对），可能是镜像还没同步，晚点再试")
+                got[p] = data
+            code = got.get("uma_bot.py")
+            if code is not None:
+                text = code.decode("utf-8")
+                compile(text, "uma_bot.py", "exec")  # 有语法错误就不换，避免更新完打不开
+                m = re.search(r'^VERSION\s*=\s*"([^"]+)"', text, re.M)
+                if not m or ver_tuple(m.group(1)) < ver_tuple(new):
+                    raise ValueError("下载到的还是旧版本（镜像可能还没同步），晚点再试")
+            app_dir = os.path.dirname(CODE_PATH)
+            bak = os.path.join(app_dir, "backup")
+            os.makedirs(bak, exist_ok=True)
+            for p, data in got.items():
+                dst = CODE_PATH if p == "uma_bot.py" else os.path.join(BASE, *p.split("/"))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.exists(dst) and p == "uma_bot.py":
+                    import shutil
+                    shutil.copy2(dst, os.path.join(bak, f"uma_bot_v{VERSION}.py"))
+                tmp = dst + ".new"
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, dst)
+            self.root.after(0, lambda: self.finish_update(new))
+        except Exception as e:
+            msg = str(e)
+            self.root.after(0, lambda: self.update_failed(msg))
+
+    def update_failed(self, msg):
+        self.updating = False
+        try:
+            self.btn_update.configure(state=NORMAL)
+        except Exception:
+            pass
+        self.log(f"更新失败：{msg}", "err")
+        messagebox.showerror(APP_NAME, f"更新失败：{msg}\n\n旧版本没有动，可以继续使用。")
+
+    def finish_update(self, new):
+        self.log(f"已更新到 v{new}，正在重新打开…", "ok")
+        self.root.update()
+        try:
+            restart_program()
+        except Exception as e:
+            messagebox.showinfo(APP_NAME, f"已更新到 v{new}，请手动重新打开程序。（{e}）")
+        self.root.after(300, self.root.destroy)
 
     def on_close(self):
         self.stop()
