@@ -4,7 +4,7 @@
 - 定时结束并重开游戏内置自动育成
 - 剧情跳过领奖励
 原理：截取游戏窗口 → OpenCV 模板比对 → 模拟鼠标点击。模板需在程序内自行截取。
-紧急停止：F10，或把鼠标移到屏幕左上角。
+启动 / 停止快捷键可在「设置」页修改（默认 F9 / F10）；把鼠标移到屏幕左上角可紧急停止。
 """
 import base64
 import csv
@@ -48,10 +48,22 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.5"
+VERSION = "3.8"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.8", "2026-10-12", [
+        "新增：「设置」页可以自己选启动 / 停止的快捷键（默认 F9 启动、F10 停止），设成同一个键就是按一下启动、再按一下停止",
+    ]),
+    ("3.7", "2026-10-12", [
+        "新增：「运行」页开关「还在「自主训练中」就等它结束再重开」：时间到时先看游戏画面，"
+        "还在自主训练就不动它，每分钟看一次，结束后才开始结束并重开",
+    ]),
+    ("3.6", "2026-10-12", [
+        "调整：自动启动只有第一次从加速器加速，之后每次都直接用 DMM 快捷方式打开游戏",
+        "新增：加速器已经自己开好、正在加速中的话，第一次也直接用 DMM 快捷方式，不再去点加速器",
+        "调整：喝体力饮料的记录改成显示这次启动后一共喝了几瓶",
+    ]),
     ("3.5", "2026-10-12", [
         "新增：粉丝目标（「运行」页），可选「今天累计」或「这次启动后」，达到后领完那次奖励就停止，不再开始新育成",
         "调整：取消「每轮最多喝几瓶」和「回复次数用完就停止」，TP 不够时照常喝体力饮料",
@@ -211,6 +223,9 @@ DEFAULT_CFG = {
     "mode": "auto_cycle",
     "cycle_minutes": 50,
     "cycle_run_now": False,
+    "wait_training": True,     # 时间到时游戏里还在「自主训练中」，就等它结束再重开
+    "hotkey_start": "F9",      # 按这个键开始运行（「无」＝不用）
+    "hotkey_stop": "F10",      # 按这个键停止；和启动键设成同一个，就是按一下启动、再按一下停止
     "cycle_timeout": 600,
     "tp_auto_drink": True,
     "tp_max_drinks": 2,        # 旧版设置，已不使用
@@ -269,6 +284,32 @@ def load_cfg():
     if cfg.get("mode") not in MODES and cfg.get("mode") not in cfg.get("custom_modes", {}):
         cfg["mode"] = "auto_cycle"
     return cfg
+
+
+HOTKEYS = ["无"] + [f"F{i}" for i in range(1, 13)] + ["Pause", "Insert", "Home", "End", "PageUp", "PageDown"]
+_KEY_NAMES = {"Pause": "pause", "Insert": "insert", "Home": "home", "End": "end",
+              "PageUp": "page_up", "PageDown": "page_down"}
+
+
+def hotkey_id(label):
+    """设置里显示的键名 → pynput 的键名；「无」回传 None。"""
+    if not label or label == "无":
+        return None
+    return _KEY_NAMES.get(label, label.lower())
+
+
+def hotkey_hint(cfg):
+    a, b = cfg.get("hotkey_start", "F9"), cfg.get("hotkey_stop", "F10")
+    parts = []
+    if a and a != "无" and a == b:
+        parts.append(f"按 {a} 启动 / 停止")
+    else:
+        if a and a != "无":
+            parts.append(f"按 {a} 启动")
+        if b and b != "无":
+            parts.append(f"按 {b} 停止")
+    head = "，".join(parts)
+    return (head + "；" if head else "") + "把鼠标移到屏幕左上角，可以随时紧急停止"
 
 
 def save_cfg(cfg):
@@ -816,6 +857,7 @@ class Bot(threading.Thread):
         self.state_text = None
         self.last_box = {}
         self.launched_once = False
+        self.run_drinks = 0   # 这次按启动后一共喝了几瓶体力饮料
         self.hung_since = None
         self.recoveries = 0
         self.next_label = "下次执行"
@@ -1377,9 +1419,11 @@ class Bot(threading.Thread):
                             self.log(self.tp_out, "warn")
                             return False
                         drinks += 1
-                        if not self.click(pt, f"使用体力饮料（本轮第 {drinks} 瓶）"):
+                        self.run_drinks += 1
+                        if not self.click(pt, f"使用体力饮料（这次启动后共 {self.run_drinks} 瓶）"):
                             no_drink = True  # 点了没反应：饮料用完、按钮变灰
                             drinks -= 1
+                            self.run_drinks -= 1
                             self.log("体力饮料好像用完了", "warn")
                         acted = True
                         break
@@ -1473,6 +1517,42 @@ class Bot(threading.Thread):
             self.wait(0.4)
         return False
 
+    def wait_training_done(self):
+        """时间到时先看游戏画面：还在「自主训练中」就不动它，每分钟看一次，等它结束再开始结束/重开。"""
+        if not self.cfg.get("wait_training", True):
+            return True
+        if "flow_home_running" not in self.tpls and "flow_running" not in self.tpls:
+            return True
+        t0 = time.time()
+        logged = False
+        while not self.stop_evt.is_set():
+            if not find_window(self.cfg["window_title"]):
+                return True   # 游戏没开：交给后面的流程
+            img = self.capture()
+            if img is None:
+                return not self.stop_evt.is_set()
+            running = self.find(img, "flow_home_running", 0.7) or self.find(img, "flow_running", 0.8)
+            if not running:
+                if logged:
+                    self.log("自主训练已经结束，开始结束并重开", "ok")
+                    self.state_text = None
+                return True
+            if not logged:
+                self.log("游戏里还在「自主训练中」，先不动它，等结束后再重开（每分钟看一次）")
+                logged = True
+            if time.time() - t0 > 3 * 3600:
+                self.log("等了 3 小时还在「自主训练中」，直接继续", "warn")
+                self.state_text = None
+                return True
+            r = self.broken_reason(img)
+            if r and self.recoveries < 10:
+                self.recover_game(r)
+            mins = int((time.time() - t0) // 60)
+            self.state_text = f"等自主训练结束…（已等 {mins} 分钟）"
+            self.wait(60)
+        self.state_text = None
+        return False
+
     def cycle_loop(self):
         auto = self.cfg.get("auto_launch")
         while not self.stop_evt.is_set():
@@ -1495,6 +1575,8 @@ class Bot(threading.Thread):
                     return
             elif auto and not find_window(self.cfg["window_title"]):
                 self.launch_game()
+            if not self.wait_training_done():
+                return
             self.cycles += 1
             self.log(f"第 {self.cycles} 次：结束并重开自动育成")
             ok = self.restart_auto()
@@ -1709,6 +1791,36 @@ class Bot(threading.Thread):
         if pt and not self.is_cyan_button(pt):
             return None
         return pt
+
+    def is_purple_button(self, pt, w, h):
+        """「停止加速」是蓝紫色的按钮。"""
+        if not self.last_screen:
+            return False
+        img, left, top = self.last_screen
+        x, y = pt[0] - left, pt[1] - top
+        reg = img[max(0, y - h // 3):max(0, y + h // 3), max(0, x - w // 3):max(0, x + w // 3)]
+        if reg.size == 0:
+            return False
+        hsv = cv2.cvtColor(reg, cv2.COLOR_BGR2HSV)
+        m = (hsv[..., 0] >= 108) & (hsv[..., 0] <= 138) & (hsv[..., 1] > 40) & (hsv[..., 2] > 80)
+        return float(m.mean()) > 0.35
+
+    def uu_is_accelerating(self):
+        """看一次加速器画面：有青色「启动游戏」、右边是「停止加速」，就是已经在加速中。"""
+        if not find_uu_window():
+            return False
+        region, est = self.uu_locate(bring_front=True)
+        if not region:
+            return False
+        for _ in range(3):
+            pt = self.uu_find("uu_start", region, est, 0.75)
+            if pt and self.is_cyan_button(pt):
+                w, h = self.last_box.get(pt, (60, 20))
+                if self.screen_last.get("uu_start", 0) >= 0.85 or \
+                        self.is_purple_button((int(pt[0] + w * 1.15), pt[1]), w, h):
+                    return True
+            self.wait(1)
+        return False
 
     def uu_cover(self, region, est):
         """找首页上赛马娘的封面。回传 dict：封面中心、预估的「立即加速」位置、文字位置、尺寸 W；找不到回传 None。"""
@@ -1953,19 +2065,19 @@ class Bot(threading.Thread):
                 self.log(f"打开 DMM 快捷方式失败：{e}", "err")
                 self.state_text = None
                 return False
-        # 第一次：从加速器点「启动游戏」；之后：加速器还开着就直接打开 DMM 快捷方式
-        elif self.launched_once and has_game and (not acc_exe.lower().endswith(".exe") or process_running(acc_exe)):
+        # 第一次：从加速器加速、点「启动游戏」；之后一律直接打开 DMM 快捷方式
+        # 你自己先开好加速器、已经在加速中的话，第一次也直接走 DMM
+        elif has_game and (self.launched_once or self.accel_already_on()):
             self.state_text = "正在启动游戏…"
-            self.log("再次启动：直接用 DMM 快捷方式打开游戏")
+            self.log("用 DMM 快捷方式打开游戏" + ("" if self.launched_once else "（加速器已经在加速中）"))
             try:
                 os.startfile(game)
             except OSError as e:
                 self.log(f"打开 DMM 快捷方式失败：{e}", "err")
                 self.state_text = None
                 return False
+            self.launched_once = True
         else:
-            if self.launched_once and has_game:
-                self.log("加速器好像已经关了，这次重新从加速器启动", "warn")
             if not path or not os.path.exists(path):
                 self.log("没有设置加速器的位置，无法自动启动。请到「设置」页选择", "err")
                 return False
@@ -1987,6 +2099,17 @@ class Bot(threading.Thread):
             self.launched_once = True
 
         return self.wait_game_ready()
+
+    def accel_already_on(self):
+        """看一次加速器画面，判断是不是已经在加速中（只认 UU）。"""
+        if not find_uu_window():
+            return False
+        self.log("加速器已经开着，看一下是不是正在加速…")
+        if self.uu_is_accelerating():
+            self.log("加速器正在加速中，不用再点加速", "ok")
+            return True
+        self.log("加速器没在加速，从加速器开始加速")
+        return False
 
     def wait_game_ready(self):
         """等游戏窗口出现（DMM 会自己启动游戏），然后点进主页。"""
@@ -2379,6 +2502,7 @@ class App:
         self.cfg_existed = os.path.exists(CFG_PATH)   # 没有 config.json＝第一次安装，不用弹更新公告
         self.cfg = load_cfg()
         self.log_q = queue.Queue()
+        self.key_q = queue.Queue()   # 快捷键在键盘监听线程里收到，交给界面线程处理
         self.bot = None
         self.fans = FanStore(FANS_PATH)
 
@@ -2386,6 +2510,9 @@ class App:
         self.v_cycle_min = tk.IntVar(value=self.cfg["cycle_minutes"])
         self.v_cycle_timeout = tk.IntVar(value=self.cfg["cycle_timeout"])
         self.v_cycle_now = tk.BooleanVar(value=self.cfg["cycle_run_now"])
+        self.v_wait_training = tk.BooleanVar(value=self.cfg.get("wait_training", True))
+        self.v_key_start = tk.StringVar(value=self.cfg.get("hotkey_start", "F9"))
+        self.v_key_stop = tk.StringVar(value=self.cfg.get("hotkey_stop", "F10"))
         self.v_tp_drink = tk.BooleanVar(value=self.cfg["tp_auto_drink"])
         self.v_tp_jewel = tk.BooleanVar(value=self.cfg.get("tp_use_jewel", False))
         self.v_tp_jewel_max = tk.IntVar(value=self.cfg.get("tp_max_jewel", 1))
@@ -2420,8 +2547,8 @@ class App:
 
         self.setup_fonts()
         self.build_header()
-        tb.Label(root, text="按 F10 或把鼠标移到屏幕左上角，可以随时紧急停止",
-                 bootstyle="secondary", padding=(16, 6)).pack(side=BOTTOM, fill=X)
+        self.lbl_hotkey = tb.Label(root, text=hotkey_hint(self.cfg), bootstyle="secondary", padding=(16, 6))
+        self.lbl_hotkey.pack(side=BOTTOM, fill=X)
         self.nb = tb.Notebook(root, bootstyle="primary")
         self.nb.pack(fill=BOTH, expand=True, padx=14, pady=(10, 0))
         self.build_run_tab()
@@ -2543,6 +2670,8 @@ class App:
                  lambda p: tb.Spinbox(p, from_=30, to=1800, increment=30, textvariable=self.v_cycle_timeout, width=7))
         tb.Checkbutton(self.box_cycle, text="启动后马上执行一次", variable=self.v_cycle_now,
                        bootstyle="success-round-toggle").pack(anchor=W, pady=(8, 0))
+        tb.Checkbutton(self.box_cycle, text="还在自主训练中就等它结束再重开", variable=self.v_wait_training,
+                       bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
         tb.Checkbutton(self.box_cycle, text="TP 不足时自动喝体力饮料", variable=self.v_tp_drink,
                        bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
         tb.Checkbutton(self.box_cycle, text="饮料用完时用宝石回复（会消耗宝石）", variable=self.v_tp_jewel,
@@ -3071,7 +3200,7 @@ class App:
 
         lb = tb.Labelframe(f, text="自动启动游戏（加速器）", padding=14)
         lb.pack(anchor=W, fill=X, pady=(14, 0))
-        tb.Checkbutton(lb, text="每轮结束后关闭游戏，下一轮前自动从加速器启动",
+        tb.Checkbutton(lb, text="每轮结束后关闭游戏，下一轮前自动启动游戏",
                        variable=self.v_auto_launch, bootstyle="success-round-toggle").pack(anchor=W)
         pr = tb.Frame(lb)
         pr.pack(fill=X, pady=(10, 4))
@@ -3085,8 +3214,8 @@ class App:
         tb.Button(gr, text="浏览…", bootstyle="secondary-outline", command=self.pick_game).pack(side=LEFT)
         tb.Checkbutton(lb, text="不开加速器，每次都直接用 DMM 快捷方式打开游戏",
                        variable=self.v_dmm_only, bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
-        tb.Label(lb, text="没开上面这个时：第一次从加速器点「启动游戏」；之后加速器还开着，就直接打开 DMM 快捷方式（没填就每次都走加速器）",
-                 bootstyle="secondary").pack(anchor=W, pady=(4, 0))
+        tb.Label(lb, text="没开上面这个时：第一次从加速器加速并点「启动游戏」，之后都直接打开 DMM 快捷方式；加速器已经在加速中的话，第一次也直接走 DMM（没填快捷方式就每次都走加速器）",
+                 bootstyle="secondary", wraplength=int(820 * self.ui_scale()), justify=LEFT).pack(anchor=W, pady=(4, 0))
         self.lbl_acc = tb.Label(lb, text="", bootstyle="secondary", justify=LEFT)
         self.lbl_acc.pack(anchor=W, pady=(6, 4))
         self.refresh_acc_hint()
@@ -3096,6 +3225,18 @@ class App:
                  lambda p: tb.Spinbox(p, from_=1, to=15, textvariable=self.v_launch_wait, width=7))
         tb.Button(lb, text="测试：关闭并自动启动一次", bootstyle="info-outline",
                   command=self.test_launch).pack(anchor=W, pady=(8, 0))
+
+        kb = tb.Labelframe(f, text="快捷键", padding=14)
+        kb.pack(anchor=W, fill=X, pady=(14, 0))
+        kr = tb.Frame(kb)
+        kr.pack(anchor=W)
+        tb.Label(kr, text="启动").pack(side=LEFT)
+        tb.Combobox(kr, textvariable=self.v_key_start, values=HOTKEYS, width=9, state="readonly").pack(side=LEFT, padx=(6, 24))
+        tb.Label(kr, text="停止").pack(side=LEFT)
+        tb.Combobox(kr, textvariable=self.v_key_stop, values=HOTKEYS, width=9, state="readonly").pack(side=LEFT, padx=(6, 12))
+        tb.Button(kr, text="保存", bootstyle="success-outline", command=self.save_settings).pack(side=LEFT)
+        tb.Label(kb, text="游戏在最前面时也能用。两个设成同一个键，就是按一下启动、再按一下停止；选「无」就不用这个键",
+                 bootstyle="secondary", wraplength=int(820 * self.ui_scale()), justify=LEFT).pack(anchor=W, pady=(8, 0))
 
         ub = tb.Labelframe(f, text="更新", padding=14)
         ub.pack(anchor=W, fill=X, pady=(14, 0))
@@ -3259,6 +3400,9 @@ class App:
                 cycle_minutes=int(self.v_cycle_min.get()),
                 cycle_timeout=int(self.v_cycle_timeout.get()),
                 cycle_run_now=bool(self.v_cycle_now.get()),
+                wait_training=bool(self.v_wait_training.get()),
+                hotkey_start=self.v_key_start.get() or "无",
+                hotkey_stop=self.v_key_stop.get() or "无",
                 tp_auto_drink=bool(self.v_tp_drink.get()),
                 tp_use_jewel=bool(self.v_tp_jewel.get()),
                 tp_max_jewel=int(self.v_tp_jewel_max.get()),
@@ -3286,6 +3430,10 @@ class App:
             messagebox.showerror(APP_NAME, "有设置项不是有效数字，请检查后再保存")
             return False
         save_cfg(self.cfg)
+        try:
+            self.lbl_hotkey.configure(text=hotkey_hint(self.cfg))
+        except Exception:
+            pass
         if not quiet:
             self.log("设置已保存", "ok")
         return True
@@ -3604,8 +3752,29 @@ class App:
                 self.root.deiconify()
 
     def on_key(self, key):
-        if pynput_kb and key == pynput_kb.Key.f10:
-            self.stop()
+        """键盘监听线程：只记下按了哪个键，真正的启动 / 停止在界面线程做。"""
+        name = getattr(key, "name", None) or getattr(key, "char", None)
+        if name:
+            self.key_q.put(str(name).lower())
+
+    def handle_hotkeys(self):
+        while not self.key_q.empty():
+            name = self.key_q.get()
+            ks, kp = hotkey_id(self.cfg.get("hotkey_start", "F9")), hotkey_id(self.cfg.get("hotkey_stop", "F10"))
+            running = self.bot is not None and self.bot.is_alive()
+            if name == ks and ks == kp:
+                if running:
+                    self.log(f"按了 {self.cfg.get('hotkey_stop')}：停止")
+                    self.stop()
+                else:
+                    self.log(f"按了 {self.cfg.get('hotkey_start')}：启动")
+                    self.start()
+            elif name == kp and running:
+                self.log(f"按了 {self.cfg.get('hotkey_stop')}：停止")
+                self.stop()
+            elif name == ks and not running:
+                self.log(f"按了 {self.cfg.get('hotkey_start')}：启动")
+                self.start()
 
     # ---------- 日志 ----------
     def log(self, msg, level="info"):
@@ -3629,6 +3798,7 @@ class App:
             if self.v_autoscroll.get():
                 self.txt.see("end")
 
+        self.handle_hotkeys()
         if self.bot and not self.bot.is_alive():
             self.bot = None
             self.set_running(False)
