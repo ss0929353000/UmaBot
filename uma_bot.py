@@ -48,10 +48,14 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.4"
+VERSION = "3.5"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.5", "2026-10-12", [
+        "新增：粉丝目标（「运行」页），可选「今天累计」或「这次启动后」，达到后领完那次奖励就停止，不再开始新育成",
+        "调整：取消「每轮最多喝几瓶」和「回复次数用完就停止」，TP 不够时照常喝体力饮料",
+    ]),
     ("3.4", "2026-10-11", [
         "新增：更新后第一次打开会显示这次更新了什么（就是这个公告）",
         "新增：「设置」页可以随时点「更新公告」查看历史更新",
@@ -77,6 +81,7 @@ BASE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", 
 TPL_DIR = os.path.join(BASE, "templates")
 CFG_PATH = os.path.join(BASE, "config.json")
 FANS_PATH = os.path.join(BASE, "fans.json")
+DRINK_SAFETY_CAP = 5  # 每轮喝体力饮料的安全上限（防认错画面一直喝），正常一轮只会喝一瓶
 JEWEL_RESET_HOUR = 4  # 萝卜的「一天」从凌晨 4 点算起（和游戏每日刷新一致）
 
 # ---- 自动更新：从 GitHub 拉新版 ----
@@ -208,10 +213,12 @@ DEFAULT_CFG = {
     "cycle_run_now": False,
     "cycle_timeout": 600,
     "tp_auto_drink": True,
-    "tp_max_drinks": 2,
+    "tp_max_drinks": 2,        # 旧版设置，已不使用
     "tp_use_jewel": False,     # 体力饮料用完时用宝石回复
     "tp_max_jewel": 1,
-    "tp_stop_when_out": True,  # 体力饮料（和宝石）次数用完、TP 还是不够时，整个停止，不再开新一轮
+    "fan_goal_on": False,      # 粉丝达到目标就不再开始新育成
+    "fan_goal_wan": 1000,      # 目标粉丝数（单位：万）
+    "fan_goal_scope": "today",  # today＝今天累计；run＝这次按启动后累计
     "story_max_episodes": 0,
     "story_max_scroll": 5,
     "story_new_region": None,
@@ -829,7 +836,9 @@ class Bot(threading.Thread):
         self.jewel_best = 0.0
         self.jewel_prev = None
         self.cycles = 0
-        self.tp_out = None    # 这一轮因为体力回复次数用完而开不了时，记下原因
+        self.tp_out = None    # 这一轮因为 TP 不够而开不了时，记下原因
+        self.run_fans = 0     # 这次按「启动」后累计获得的粉丝
+        self.goal_hit = None  # 粉丝达到目标时记下说明，这一轮结束后就停止
         self.story_count = 0
         self.scrolls = 0
 
@@ -1071,6 +1080,31 @@ class Bot(threading.Thread):
             self.wait(min(end - time.time(), 1))
         return False
 
+    def fans_so_far(self, extra=0):
+        """目前累计的粉丝（今天或这次启动后），extra 是这一轮刚读到、还没存进记录的。"""
+        if self.cfg.get("fan_goal_scope", "today") == "run":
+            return self.run_fans + extra
+        if not self.fans:
+            return extra
+        rh = int(self.cfg.get("fan_reset_hour", 0))
+        today = FanStore.day_of(datetime.now(), rh)
+        return self.fans.daily(rh).get(today, (0, 0, 0))[0] + extra
+
+    def fan_goal(self):
+        return int(float(self.cfg.get("fan_goal_wan", 0)) * 10000) if self.cfg.get("fan_goal_on") else 0
+
+    def check_fan_goal(self, gain):
+        goal = self.fan_goal()
+        if not goal:
+            return
+        total = self.fans_so_far(gain)
+        scope = "这次启动后" if self.cfg.get("fan_goal_scope") == "run" else "今天"
+        if total >= goal:
+            self.goal_hit = f"{scope}已获得粉丝 {fmt_fans(total)}，达到目标 {fmt_fans(goal)}"
+            self.log(self.goal_hit + "：领完这次的奖励就停止，不再开始新育成", "ok")
+        else:
+            self.log(f"{scope}粉丝 {fmt_fans(total)} / 目标 {fmt_fans(goal)}，还差 {fmt_fans(goal - total)}")
+
     STEPS = [
         ("flow_ok", "OK"),
         ("flow_decide", "决定"),
@@ -1094,6 +1128,10 @@ class Bot(threading.Thread):
         ("flow_home_running", "育成"),
         ("flow_home", "育成"),
     ]
+
+    # 粉丝达标后不再点的按钮（会开始新育成的那些）
+    START_KEYS = {"end_again", "end_go", "flow_ikusei_start", "flow_next", "flow_auto_start", "flow_decide",
+                  "__drink", "__jewel", "__running", "flow_tp_recover", "flow_home", "flow_home_running"}
 
     # 领奖画面的「下项」右边常盖着一个闪光圈，用只框左半边的模板、门槛放宽
     STEP_THR = {"end_next": 0.78, "end_next_b": 0.78, "end_finish": 0.9}
@@ -1249,6 +1287,8 @@ class Bot(threading.Thread):
                     first = r["jewels_before"] if r["jewels_before"] is not None else r["jewels_after"]
                     log[day] = {"n": int(first), "manual": False}
                 save_state(st)
+            if r["gain"] is not None:
+                self.run_fans += r["gain"]
             if (r["gain"] is not None or jewels is not None) and self.fans:
                 self.fans.add(r["gain"], jewels)
 
@@ -1299,6 +1339,7 @@ class Bot(threading.Thread):
                 if gain is not None:
                     self.result["gain"] = gain
                     self.log(f"本次育成获得粉丝 +{gain:,}", "ok")
+                    self.check_fan_goal(gain)
                 else:
                     self.log("没读到这次的粉丝数，可以到「粉丝统计」页手动补记", "warn")
                 continue
@@ -1320,13 +1361,19 @@ class Bot(threading.Thread):
                     self.wait(0.4)
                 continue
 
+            if self.goal_hit:
+                # 粉丝已达标：只把这次的结算点完，看到「再次育成」或回到主页就停，不开始新育成
+                if self.find(img, "end_again") or self.find(img, "flow_home") or self.find(img, "flow_home_running"):
+                    return False
             acted = False
             for key, label in self.STEPS + [(k, k) for k in user_keys]:
+                if self.goal_hit and key in self.START_KEYS:
+                    continue
                 if key == "__drink":
                     pt = None if no_drink else self.find_drink_use(img)
                     if pt:
-                        if drinks >= self.cfg["tp_max_drinks"]:
-                            self.tp_out = f"本轮已经喝了 {drinks} 瓶体力饮料，达到上限，TP 还是不够"
+                        if drinks >= DRINK_SAFETY_CAP:  # 只是防止认错画面一直喝；正常一轮只要一瓶
+                            self.tp_out = f"这一轮已经喝了 {drinks} 瓶 TP 还是不够，可能认错画面，先停在这里"
                             self.log(self.tp_out, "warn")
                             return False
                         drinks += 1
@@ -1429,6 +1476,13 @@ class Bot(threading.Thread):
     def cycle_loop(self):
         auto = self.cfg.get("auto_launch")
         while not self.stop_evt.is_set():
+            goal = self.fan_goal()
+            if goal and self.fans_so_far() >= goal:
+                scope = "这次启动后" if self.cfg.get("fan_goal_scope") == "run" else "今天"
+                self.log(f"{scope}粉丝已经达到目标 {fmt_fans(goal)}，不再开始新育成，已停止", "ok")
+                self.state_text = "粉丝已达标，已停止"
+                self.stop_evt.set()
+                return
             first = self.cycles == 0
             if not (first and self.cfg["cycle_run_now"]):
                 target = time.time() + self.cfg["cycle_minutes"] * 60
@@ -1444,13 +1498,13 @@ class Bot(threading.Thread):
             self.cycles += 1
             self.log(f"第 {self.cycles} 次：结束并重开自动育成")
             ok = self.restart_auto()
-            if ok:
-                self.log("新的自动育成已开始，已回到主页", "ok")
-            elif self.tp_out and self.cfg.get("tp_stop_when_out", True) and not self.stop_evt.is_set():
-                self.log(f"体力回复次数用完了（{self.tp_out}），已停止，不再开新一轮", "err")
-                self.state_text = "体力用完，已停止"
+            if self.goal_hit and not self.stop_evt.is_set():
+                self.log(f"{self.goal_hit}，这次育成的奖励已领完，不再开始新育成，已停止", "ok")
+                self.state_text = "粉丝已达标，已停止"
                 self.stop_evt.set()
                 return
+            if ok:
+                self.log("新的自动育成已开始，已回到主页", "ok")
             elif not self.stop_evt.is_set():
                 self.save_debug_shot()
                 self.log("这次没重开成功，游戏先不关，下个周期再试", "warn")
@@ -2333,10 +2387,11 @@ class App:
         self.v_cycle_timeout = tk.IntVar(value=self.cfg["cycle_timeout"])
         self.v_cycle_now = tk.BooleanVar(value=self.cfg["cycle_run_now"])
         self.v_tp_drink = tk.BooleanVar(value=self.cfg["tp_auto_drink"])
-        self.v_tp_max = tk.IntVar(value=self.cfg["tp_max_drinks"])
         self.v_tp_jewel = tk.BooleanVar(value=self.cfg.get("tp_use_jewel", False))
         self.v_tp_jewel_max = tk.IntVar(value=self.cfg.get("tp_max_jewel", 1))
-        self.v_tp_stop = tk.BooleanVar(value=self.cfg.get("tp_stop_when_out", True))
+        self.v_goal_on = tk.BooleanVar(value=self.cfg.get("fan_goal_on", False))
+        self.v_goal_wan = tk.DoubleVar(value=self.cfg.get("fan_goal_wan", 1000))
+        self.v_goal_scope = tk.StringVar(value="这次启动后" if self.cfg.get("fan_goal_scope") == "run" else "今天累计")
         self.v_story_max = tk.IntVar(value=self.cfg["story_max_episodes"])
         self.v_story_scroll = tk.IntVar(value=self.cfg["story_max_scroll"])
         self.v_title = tk.StringVar(value=self.cfg["window_title"])
@@ -2435,6 +2490,25 @@ class App:
         tb.Label(fr, text=label).pack(side=LEFT)
         make(fr).pack(side=RIGHT)
 
+    def refresh_goal(self):
+        """运行页「粉丝目标」下面那行进度。"""
+        if not hasattr(self, "lbl_goal"):
+            return
+        try:
+            goal = int(float(self.v_goal_wan.get()) * 10000)
+        except (tk.TclError, ValueError):
+            goal = 0
+        if not self.v_goal_on.get() or goal <= 0:
+            self.lbl_goal.configure(text="关闭时会一直按时间重开")
+            return
+        if self.v_goal_scope.get() == "这次启动后":
+            have = self.bot.run_fans if self.bot else 0
+            self.lbl_goal.configure(text=f"这次启动后 {fmt_fans(have)} / {fmt_fans(goal)}（按启动后从 0 算）")
+        else:
+            have = getattr(self, "today_fans", 0)
+            left = max(0, goal - have)
+            self.lbl_goal.configure(text=f"今天 {fmt_fans(have)} / {fmt_fans(goal)}" + ("　已达标" if not left else f"　还差 {fmt_fans(left)}"))
+
     # ---------- 运行页 ----------
     def build_run_tab(self):
         f = tb.Frame(self.nb, padding=14)
@@ -2471,14 +2545,24 @@ class App:
                        bootstyle="success-round-toggle").pack(anchor=W, pady=(8, 0))
         tb.Checkbutton(self.box_cycle, text="TP 不足时自动喝体力饮料", variable=self.v_tp_drink,
                        bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
-        self.row(self.box_cycle, "每轮最多喝几瓶",
-                 lambda p: tb.Spinbox(p, from_=0, to=10, textvariable=self.v_tp_max, width=7))
         tb.Checkbutton(self.box_cycle, text="饮料用完时用宝石回复（会消耗宝石）", variable=self.v_tp_jewel,
                        bootstyle="warning-round-toggle").pack(anchor=W, pady=(6, 0))
         self.row(self.box_cycle, "每轮最多用几次宝石",
                  lambda p: tb.Spinbox(p, from_=0, to=10, textvariable=self.v_tp_jewel_max, width=7))
-        tb.Checkbutton(self.box_cycle, text="回复次数用完就停止，不再开新一轮", variable=self.v_tp_stop,
-                       bootstyle="danger-round-toggle").pack(anchor=W, pady=(6, 0))
+        tb.Separator(self.box_cycle).pack(fill=X, pady=(10, 4))
+        tb.Checkbutton(self.box_cycle, text="粉丝达到目标就停止，不再开始新育成", variable=self.v_goal_on,
+                       bootstyle="danger-round-toggle", command=self.refresh_goal).pack(anchor=W, pady=(4, 0))
+        gr = tb.Frame(self.box_cycle)
+        gr.pack(fill=X, pady=4)
+        tb.Label(gr, text="目标").pack(side=LEFT)
+        tb.Combobox(gr, textvariable=self.v_goal_scope, values=("今天累计", "这次启动后"), state="readonly",
+                    width=9).pack(side=LEFT, padx=(6, 0))
+        tb.Label(gr, text="万").pack(side=RIGHT, padx=(4, 0))
+        tb.Spinbox(gr, from_=1, to=999999, increment=100, textvariable=self.v_goal_wan, width=7).pack(side=RIGHT)
+        self.lbl_goal = tb.Label(self.box_cycle, text="", bootstyle="secondary")
+        self.lbl_goal.pack(anchor=W)
+        self.v_goal_scope.trace_add("write", lambda *a: self.refresh_goal())
+        self.v_goal_wan.trace_add("write", lambda *a: self.refresh_goal())
         self.box_story = tb.Labelframe(holder, text="剧情", padding=12)
         self.row(self.box_story, "最多看几话（0 为不限）",
                  lambda p: tb.Spinbox(p, from_=0, to=999, textvariable=self.v_story_max, width=7))
@@ -2860,6 +2944,8 @@ class App:
                 f"合计（{len(daily)} 天）", all_c, f"+{all_f:,}", f"{all_j:+,}",
                 f"+{all_f // all_c:,}" if all_c else "0"), tags=("total",))
         self.lbl_fans.configure(text=f"今日粉丝 +{fmt_fans(t_sum)}　宝石 {t_j:+,}")
+        self.today_fans = t_sum
+        self.refresh_goal()
         self.fan_tree.delete(*self.fan_tree.get_children())
         recs = self.fans.records
         for i in range(len(recs) - 1, max(-1, len(recs) - 301), -1):
@@ -3174,10 +3260,11 @@ class App:
                 cycle_timeout=int(self.v_cycle_timeout.get()),
                 cycle_run_now=bool(self.v_cycle_now.get()),
                 tp_auto_drink=bool(self.v_tp_drink.get()),
-                tp_max_drinks=int(self.v_tp_max.get()),
                 tp_use_jewel=bool(self.v_tp_jewel.get()),
                 tp_max_jewel=int(self.v_tp_jewel_max.get()),
-                tp_stop_when_out=bool(self.v_tp_stop.get()),
+                fan_goal_on=bool(self.v_goal_on.get()),
+                fan_goal_wan=float(self.v_goal_wan.get()),
+                fan_goal_scope="run" if self.v_goal_scope.get() == "这次启动后" else "today",
                 story_max_episodes=int(self.v_story_max.get()),
                 story_max_scroll=int(self.v_story_scroll.get()),
                 window_title=self.v_title.get().strip() or "umamusume",
@@ -3591,7 +3678,7 @@ class App:
         tb.Frame(win, height=3, bootstyle="warning").pack(fill=X)
         body = tb.Frame(win, padding=(18, 14, 18, 6))
         body.pack(fill=BOTH, expand=True)
-        txt = tk.Text(body, wrap="word", relief="flat", bd=0, highlightthickness=0, cursor="arrow",
+        txt = tk.Text(body, wrap="char", relief="flat", bd=0, highlightthickness=0, cursor="arrow",
                       bg=PALETTE["bg"], fg=PALETTE["fg"], font=(FONT, 10), padx=4, pady=4,
                       width=58, height=min(20, 3 + sum(len(e[2]) + 2 for e in items)), spacing1=2, spacing3=4)
         sb = tb.Scrollbar(body, orient=VERTICAL, command=txt.yview, bootstyle="round")
