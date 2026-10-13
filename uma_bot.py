@@ -48,10 +48,29 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.8"
+VERSION = "3.12"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.12", "2026-10-13", [
+        "调整：UU 加速改成从首页右下角「我的游戏」进去，找到赛马娘卡片再点「立即加速」",
+    ]),
+    ("3.11", "2026-10-13", [
+        "优化：UU 不认模拟鼠标时，改成直接对 UU 窗口送鼠标消息来悬停和点击",
+        "优化：加速失败时换方法重试（第 2 次用窗口消息点击、第 3 次直接点封面图）",
+        "新增：悬停没出现「立即加速」时，在 debug 文件夹存一张 click_uu_hover_fail 截图",
+    ]),
+    ("3.10", "2026-10-13", [
+        "新增：「设置」页「以管理员身份运行本程序」。UU 加速器是管理员权限时，Windows 会挡掉一般程序模拟的鼠标，"
+        "要打开这个，鼠标移过去才会出现「立即加速」",
+        "优化：在 UU 上改用真的鼠标移动事件（一小步一小步移过去），更像手动操作",
+        "新增：发现 UU 是管理员权限、本程序不是时，日志会提示",
+    ]),
+    ("3.9", "2026-10-13", [
+        "修正：UU 加速时，鼠标在封面图上微微移动，让「立即加速」真的出现再点",
+        "修正：点完「立即加速」不会再把鼠标移到「赛马娘Pretty Derby」那行字上",
+        "修正：本程序窗口在 UU 后面重叠时，会把 UU 的封面认不出来的问题",
+    ]),
     ("3.8", "2026-10-12", [
         "新增：「设置」页可以自己选启动 / 停止的快捷键（默认 F9 启动、F10 停止），设成同一个键就是按一下启动、再按一下停止",
     ]),
@@ -224,6 +243,7 @@ DEFAULT_CFG = {
     "cycle_minutes": 50,
     "cycle_run_now": False,
     "wait_training": True,     # 时间到时游戏里还在「自主训练中」，就等它结束再重开
+    "run_as_admin": False,     # 以管理员身份运行（UU 加速器是管理员权限时，模拟的鼠标才会被它接收）
     "hotkey_start": "F9",      # 按这个键开始运行（「无」＝不用）
     "hotkey_stop": "F10",      # 按这个键停止；和启动键设成同一个，就是按一下启动、再按一下停止
     "cycle_timeout": 600,
@@ -284,6 +304,70 @@ def load_cfg():
     if cfg.get("mode") not in MODES and cfg.get("mode") not in cfg.get("custom_modes", {}):
         cfg["mode"] = "auto_cycle"
     return cfg
+
+
+# ================= 管理员权限 / 真实鼠标移动 =================
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def process_elevated(pid):
+    """看某个程序是不是以管理员身份在跑。我们自己不是管理员时，连查都查不了，也算它是。"""
+    try:
+        k32, adv = ctypes.windll.kernel32, ctypes.windll.advapi32
+        h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return not is_admin()
+        try:
+            tok = ctypes.c_void_p()
+            if not adv.OpenProcessToken(h, 0x0008, ctypes.byref(tok)):   # TOKEN_QUERY
+                return not is_admin()
+            try:
+                val, ret = ctypes.c_uint32(0), ctypes.c_uint32(0)
+                if adv.GetTokenInformation(tok, 20, ctypes.byref(val), 4, ctypes.byref(ret)):  # TokenElevation
+                    return bool(val.value)
+                return False
+            finally:
+                k32.CloseHandle(tok)
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return False
+
+
+def relaunch_as_admin():
+    """用管理员身份重新打开本程序（会跳出 Windows 的确认窗口）。成功回传 True。"""
+    try:
+        if getattr(sys, "frozen", False):
+            exe, params = sys.executable, "--elevated"
+        else:
+            exe, params = sys.executable, f'"{os.path.abspath(sys.argv[0])}" --elevated'
+        return ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, BASE, 1) > 32
+    except Exception:
+        return False
+
+
+def real_move(x, y, duration=0.4):
+    """像真的鼠标一样一小步一小步移过去（送出真的鼠标移动事件），有些程序只认这种移动才会显示悬停效果。"""
+    try:
+        vl, vt = win32api.GetSystemMetrics(76), win32api.GetSystemMetrics(77)
+        vw, vh = win32api.GetSystemMetrics(78), win32api.GetSystemMetrics(79)
+        sx, sy = win32api.GetCursorPos()
+        steps = max(8, int(duration / 0.015))
+        for i in range(1, steps + 1):
+            t = i / steps
+            t = 1 - (1 - t) * (1 - t)   # 先快后慢
+            px = sx + (x - sx) * t + random.uniform(-1.5, 1.5) * (1 - t)
+            py = sy + (y - sy) * t + random.uniform(-1.5, 1.5) * (1 - t)
+            nx = int((px - vl) * 65535 / max(1, vw - 1))
+            ny = int((py - vt) * 65535 / max(1, vh - 1))
+            win32api.mouse_event(0x0001 | 0x8000 | 0x4000, nx, ny, 0, 0)  # MOVE | ABSOLUTE | VIRTUALDESK
+            time.sleep(duration / steps)
+    except Exception:
+        pyautogui.moveTo(x, y, duration=duration)
 
 
 HOTKEYS = ["无"] + [f"F{i}" for i in range(1, 13)] + ["Pause", "Insert", "Home", "End", "PageUp", "PageDown"]
@@ -550,6 +634,10 @@ def show_window(hwnd):
 
 # UU 窗口里的相对位置（从你录的影片量出来的；UU 窗口的版面固定，只会跟着缩放）
 UU_REL = {"cover": (0.147, 0.37), "tile": (0.147, 0.553), "label": (0.147, 0.642), "start": (0.105, 0.477)}
+# 「我的游戏」：首页右下角的按钮、首页分页、我的游戏页里每一列卡片的中心（都是相对 UU 窗口的位置）
+UU_MYGAMES_BTN = (0.8505, 0.7725)
+UU_HOME_TAB = (0.183, 0.0727)
+UU_MYG_COLS = [0.110, 0.266, 0.422, 0.578, 0.734, 0.890]
 UU_SETTLE = 10   # 详情页出现后等几秒再点「启动游戏」
 UU_TPL_W = 896   # 内附的 UU 模板是在 UU 窗口宽 896 像素时截的，用来预估缩放
 
@@ -1611,7 +1699,7 @@ class Bot(threading.Thread):
     # ---- 自动启动 / 关闭游戏 ----
     SCREEN_SCALES = [1.0, 0.9, 1.1, 0.8, 1.25, 0.75, 1.33, 0.67, 1.5, 0.6, 1.75, 0.5, 2.0, 0.4, 2.5, 0.33]
 
-    def find_on_screen(self, key, thr=0.75, region=None, color=False, est=None):
+    def find_on_screen(self, key, thr=0.75, region=None, color=False, est=None, crop=None):
         """在桌面（或只在 region=(左,上,右,下) 这块范围里）找按钮。
         color=True 用彩色比对（小按钮用灰阶很容易跟背景图「很像」）；est 是预估的缩放。
         粗找一遍后，会在最像的缩放附近再细找，文字类模板对缩放很敏感。"""
@@ -1619,11 +1707,17 @@ class Bot(threading.Thread):
         tpl = cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_COLOR) if os.path.exists(path) else None
         if tpl is None:
             return None
+        if crop:  # 只用模板左边这几列（例如「赛马娘Pretty」，「我的游戏」里名字后面会被截掉）
+            tpl = tpl[:, :crop]
+        key_ = key
+        key = key + (f"#{crop}" if crop else "")
         img, left, top = grab_screen()
         self.last_screen = (img, left, top)
         self.screen_black = float(img.std()) < 4  # 远程桌面最小化或断开时，截到的是全黑画面
         img = img.copy()
-        for h_ in own_windows():
+        # 在整个桌面找时，要把本程序自己的窗口盖掉（免得认到自己界面上的字）；
+        # 只在 UU 窗口里找时不用：UU 已经叫到最前面，本程序窗口就算在后面跟它重叠，也不能把 UU 的画面涂黑
+        for h_ in ([] if region else own_windows()):
             try:
                 l, t_, r, b = win32gui.GetWindowRect(h_)
                 img[max(0, t_ - top):max(0, b - top), max(0, l - left):max(0, r - left)] = 0
@@ -1884,6 +1978,231 @@ class Bot(threading.Thread):
         reg = img[max(0, int(y - 0.75 * W)):max(0, int(y + 0.75 * W)), max(0, int(x - 0.55 * W)):max(0, int(x + 0.55 * W))]
         return float(cv2.cvtColor(reg, cv2.COLOR_BGR2GRAY).mean()) if reg.size else 0.0
 
+    def nudge_mouse(self, times=3, size=4):
+        """原地微微移动鼠标（送出真的鼠标移动事件，不是直接把游标瞬移过去）。"""
+        for _ in range(times):
+            dx, dy = random.randint(-size, size), random.randint(-size, size)
+            try:
+                win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, dx, dy, 0, 0)
+                time.sleep(random.uniform(0.04, 0.09))
+                win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, -dx, -dy, 0, 0)
+            except Exception:
+                x, y = pyautogui.position()
+                pyautogui.moveTo(x + dx, y + dy, duration=0.05)
+                pyautogui.moveTo(x, y, duration=0.05)
+            time.sleep(random.uniform(0.05, 0.12))
+
+    @staticmethod
+    def _msg_target(x, y):
+        """鼠标位置下面的那个子窗口，和换算成它自己的坐标。"""
+        hw = win32gui.WindowFromPoint((int(x), int(y)))
+        if not hw:
+            return None, 0
+        cx, cy = win32gui.ScreenToClient(hw, (int(x), int(y)))
+        return hw, ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
+
+    def post_hover(self, x, y):
+        """直接对 UU 的窗口送「鼠标移到这里」的消息（不经过模拟输入），有些程序只认这种。"""
+        try:
+            for dx, dy in ((0, 0), (2, 1), (-2, 0), (1, -1), (0, 0)):
+                hw, lp = self._msg_target(x + dx, y + dy)
+                if hw:
+                    win32gui.PostMessage(hw, 0x0200, 0, lp)   # WM_MOUSEMOVE
+                time.sleep(0.03)
+        except Exception:
+            pass
+
+    def post_click(self, x, y, label):
+        """用窗口消息点一下（不经过模拟输入）。"""
+        try:
+            hw, lp = self._msg_target(x, y)
+            if not hw:
+                return False
+            win32gui.PostMessage(hw, 0x0200, 0, lp)            # WM_MOUSEMOVE
+            time.sleep(0.05)
+            win32gui.PostMessage(hw, 0x0201, 0x0001, lp)       # WM_LBUTTONDOWN
+            time.sleep(random.uniform(0.06, 0.12))
+            win32gui.PostMessage(hw, 0x0202, 0, lp)            # WM_LBUTTONUP
+            self.log(f"点击 {label}（用窗口消息）", "ok")
+            return True
+        except Exception as e:
+            self.log(f"用窗口消息点击失败：{e}", "warn")
+            return False
+
+    def hover_cover(self, c):
+        """把鼠标放在封面图上微微移动，直到「立即加速」出现并停稳；回传它的位置（12 秒都没出现回传 None）。"""
+        cx, cy, W = c["cover"][0], c["cover"][1], c["W"]
+        real_move(cx, cy, random.uniform(0.5, 0.8))
+        end = time.time() + 12
+        prev = None
+        k = 0
+        while time.time() < end and not self.stop_evt.is_set():
+            self.nudge_mouse(3)
+            k += 1
+            if k >= 3:  # 真的鼠标移动没反应：再直接对 UU 窗口送「鼠标移到这里」的消息
+                x, y = pyautogui.position()
+                self.post_hover(x, y)
+            if k % 4 == 0:  # 一直没反应：换到封面上另一个点再试
+                real_move(int(cx + random.uniform(-0.25, 0.25) * W), int(cy + random.uniform(-0.3, 0.3) * W),
+                          random.uniform(0.2, 0.4))
+            self.wait(0.6)
+            p = self.cyan_text_at(c)
+            if p and prev and abs(p[0] - prev[0]) < W * 0.04 and abs(p[1] - prev[1]) < W * 0.04:
+                return p
+            prev = p
+        return None
+
+    # ---- 从「我的游戏」加速 ----
+    def find_mygames_card(self, region):
+        """在「我的游戏」页找到赛马娘那张卡：认「赛马娘Pretty」这几个字，再对齐到所在的那一列。"""
+        if not region:
+            return None
+        l, t, r, b = region
+        ww, wh = r - l, b - t
+        pt = self.find_on_screen("uu_tile", thr=0.75, region=region, color=True, est=ww / 1000, crop=99)
+        if not pt:
+            pt = self.find_on_screen("uu_tile", thr=0.75, region=region, color=True, crop=99)
+        if not pt:
+            return None
+        ry = (pt[1] - t) / wh
+        if not (0.50 <= ry <= 0.62 or 0.90 <= ry <= 1.0):   # 不在卡片名字那一行（例如在首页）
+            return None
+        guess = (pt[0] - l) / ww + 0.0215
+        col = min(UU_MYG_COLS, key=lambda c: abs(c - guess))
+        cx = l + col * ww if abs(col - guess) < 0.05 else pt[0] + 0.0215 * ww
+        return {"card": (int(cx), int(pt[1] - 0.1195 * ww)), "btn": (int(cx), int(pt[1] - 0.0525 * ww)),
+                "label": pt, "ww": ww}
+
+    def cyan_btn_at(self, card):
+        """悬停后卡片下方会出现青色的「立即加速」按钮。"""
+        img, left, top = grab_screen()
+        ww = card["ww"]
+        x, y = card["btn"][0] - left, card["btn"][1] - top
+        w, h = int(0.05 * ww), int(0.014 * ww)
+        reg = img[max(0, y - h):max(0, y + h), max(0, x - w):max(0, x + w)]
+        if reg.size == 0:
+            return None
+        hsv = cv2.cvtColor(reg, cv2.COLOR_BGR2HSV)
+        m = (hsv[..., 0] >= 78) & (hsv[..., 0] <= 102) & (hsv[..., 1] > 70) & (hsv[..., 2] > 110)
+        if m.mean() < 0.3:
+            return None
+        ys, xs = np.nonzero(m)
+        return int(left + max(0, x - w) + np.median(xs)), int(top + max(0, y - h) + np.median(ys))
+
+    def open_mygames(self, region, est):
+        """在首页就点右下角「我的游戏」；不在首页就先点上面的「首页」。回传是否已经在「我的游戏」页。"""
+        if self.find_mygames_card(region):
+            return True
+        l, t, r, b = region
+        ww, wh = r - l, b - t
+        c = self.uu_cover(region, est)
+        if c and c.get("detail"):
+            return False
+        if c and c["how"].startswith("认出"):   # 在首页
+            pt = (int(l + ww * UU_MYGAMES_BTN[0]), int(t + wh * UU_MYGAMES_BTN[1]))
+            real_move(pt[0], pt[1], random.uniform(0.4, 0.6))
+            self.wait(0.4)
+            self.last_box[pt] = (int(ww * 0.12), int(wh * 0.04))
+            self.click_screen(pt, "UU：右下角「我的游戏」")
+        else:
+            pt = (int(l + ww * UU_HOME_TAB[0]), int(t + wh * UU_HOME_TAB[1]))
+            real_move(pt[0], pt[1], random.uniform(0.4, 0.6))
+            self.last_box[pt] = (int(ww * 0.02), int(wh * 0.015))
+            self.click_screen(pt, "UU：上方「首页」")
+            self.wait(2)
+            return self.open_mygames_once(region, est)
+        self.wait(2.5)
+        return bool(self.find_mygames_card(region))
+
+    def open_mygames_once(self, region, est):
+        l, t, r, b = region
+        c = self.uu_cover(region, est)
+        if c and not c.get("detail") and c["how"].startswith("认出"):
+            ww, wh = r - l, b - t
+            pt = (int(l + ww * UU_MYGAMES_BTN[0]), int(t + wh * UU_MYGAMES_BTN[1]))
+            real_move(pt[0], pt[1], random.uniform(0.4, 0.6))
+            self.wait(0.4)
+            self.last_box[pt] = (int(ww * 0.12), int(wh * 0.04))
+            self.click_screen(pt, "UU：右下角「我的游戏」")
+            self.wait(2.5)
+        return bool(self.find_mygames_card(region))
+
+    def uu_accelerate_mygames(self, region, est, n):
+        """首页右下角「我的游戏」→ 赛马娘卡片 →「立即加速」→ 确认 UU 真的开始加速。
+        回传 None＝找不到；"detail"＝已经在加速详情页；True＝已开始加速；False＝点了但没反应。"""
+        if not region:
+            return None
+        if not self.open_mygames(region, est):
+            c = self.uu_cover(region, est)
+            if c and c.get("detail"):
+                return "detail"
+            return None
+        card = self.find_mygames_card(region)
+        if not card:
+            return None
+        ww = card["ww"]
+        if n == 1:
+            self.log(f"UU：在「我的游戏」找到赛马娘，卡片在 ({card['card'][0]}, {card['card'][1]})")
+        cinfo = {"cover": card["card"], "W": 0.13 * ww}
+        base = self.cover_brightness(cinfo)
+        cx, cy = card["card"]
+        btn = None
+        if n != 3:
+            # 鼠标移到卡片上微微移动，等「立即加速」按钮出现
+            real_move(cx, cy, random.uniform(0.5, 0.8))
+            end = time.time() + 10
+            prev, k = None, 0
+            while time.time() < end and not self.stop_evt.is_set():
+                self.nudge_mouse(3)
+                k += 1
+                if k >= 2:
+                    x, y = pyautogui.position()
+                    self.post_hover(x, y)
+                if k % 4 == 0:
+                    real_move(int(cx + random.uniform(-0.03, 0.03) * ww), int(cy + random.uniform(-0.05, 0.05) * ww),
+                              random.uniform(0.2, 0.4))
+                self.wait(0.6)
+                p = self.cyan_btn_at(card)
+                if p and prev and abs(p[0] - prev[0]) < ww * 0.01 and abs(p[1] - prev[1]) < ww * 0.01:
+                    btn = p
+                    break
+                prev = p
+        if btn:
+            self.log("鼠标在卡片上，看到了「立即加速」")
+            real_move(btn[0], btn[1], random.uniform(0.3, 0.5))
+            self.nudge_mouse(2)
+            self.wait(random.uniform(0.4, 0.7))
+            self.last_box[btn] = (int(ww * 0.06), int(ww * 0.012))
+            if n % 2 == 0:
+                self.post_hover(btn[0], btn[1])
+                self.post_click(btn[0], btn[1], f"UU：立即加速（第 {n} 次）")
+            else:
+                self.click_screen(btn, f"UU：立即加速（第 {n} 次）")
+            self.save_click_shot(btn, "uu_tile")
+        else:
+            # 没看到「立即加速」：直接点「立即加速」该出现的位置（卡片下半部）
+            pt = card["btn"]
+            if n != 3:
+                self.log("卡片上没出现「立即加速」，直接点卡片下半部", "warn")
+                self.save_click_shot(pt, "uu_hover_fail")
+            real_move(pt[0], pt[1], random.uniform(0.3, 0.5))
+            self.wait(0.4)
+            self.last_box[pt] = (int(ww * 0.06), int(ww * 0.012))
+            self.click_screen(pt, f"UU：赛马娘卡片（第 {n} 次）")
+            self.save_click_shot(pt, "uu_tile")
+        self.wait(1.5)
+        end = time.time() + 12
+        while time.time() < end and not self.stop_evt.is_set():
+            self.wait(1.5)
+            if self.uu_find_start(region, est):
+                return True
+            if base > 20 and self.cover_brightness(cinfo) < base * 0.6:
+                return True    # 卡片变暗、出现转圈：加速中
+            c = self.uu_cover(region, est)
+            if c and c.get("detail"):
+                return True
+        return False
+
     def uu_accelerate(self, region, est, n):
         """悬停在封面上 → 点出现的「立即加速」→ 确认 UU 真的开始加速。
         回传 None＝首页上找不到封面；True＝已开始加速；False＝点了但没反应。"""
@@ -1896,31 +2215,35 @@ class Bot(threading.Thread):
             self.log(f"UU：{c['how']}，封面在 ({c['cover'][0]}, {c['cover'][1]})"
                      + (f"；UU 窗口 {region[2] - region[0]}×{region[3] - region[1]}" if region else "；没找到 UU 窗口，在整个桌面找"))
         base = self.cover_brightness(c)
-        # 慢慢移到封面上，停够久让「立即加速」的动画完全滑出来，而且位置要两次一样才算稳定
-        pyautogui.moveTo(c["cover"][0], c["cover"][1], duration=random.uniform(0.6, 1.0), tween=pyautogui.easeOutQuad)
-        self.wait(2.5)
-        acc, prev = None, None
-        for _ in range(6):
-            p = self.cyan_text_at(c)
-            if p and prev and abs(p[0] - prev[0]) < c["W"] * 0.04 and abs(p[1] - prev[1]) < c["W"] * 0.04:
-                acc = p
-                break
-            prev = p
-            self.wait(0.7)
-        if acc:
-            self.log("鼠标悬停在封面上，看到了「立即加速」")
+        # 第 3 次：不等悬停，直接点封面图本身，看 UU 会不会有反应
+        if n == 3:
+            acc = c["cover"]
+            self.log("前两次都没加速成功，这次直接点封面图试试", "warn")
+            real_move(acc[0], acc[1], random.uniform(0.4, 0.6))
+            self.wait(0.5)
+            self.last_box[acc] = (int(c["W"] * 0.4), int(c["W"] * 0.4))
+            self.click_screen(acc, f"UU：赛马娘封面（第 {n} 次）")
         else:
-            acc = prev or c["accel"]
-            self.log("悬停后没等到稳定的「立即加速」字样，按位置点封面下方", "warn")
-        # 先移到字上停一下再点，不要一移过去就点
-        pyautogui.moveTo(acc[0], acc[1], duration=random.uniform(0.4, 0.7), tween=pyautogui.easeOutQuad)
-        self.wait(random.uniform(0.6, 1.0))
-        self.last_box[acc] = (int(c["W"] * 0.3), int(c["W"] * 0.06))
-        self.click_screen(acc, f"UU：立即加速（第 {n} 次）")
+            # 移到封面（文字上面那张图）上，然后在上面微微移动：UU 要收到鼠标移动才会显示「立即加速」
+            acc = self.hover_cover(c)
+            if acc:
+                self.log("鼠标在封面上，看到了「立即加速」")
+            else:
+                acc = c["accel"]
+                self.log("在封面上移动了 12 秒都没看到「立即加速」，按位置点封面下方", "warn")
+                self.save_click_shot(acc, "uu_hover_fail")
+            # 移到「立即加速」上，停一下再点（不要一移过去就点）
+            real_move(acc[0], acc[1], random.uniform(0.3, 0.5))
+            self.nudge_mouse(3)
+            self.wait(random.uniform(0.5, 0.8))
+            self.last_box[acc] = (int(c["W"] * 0.3), int(c["W"] * 0.06))
+            if n % 2 == 0:   # 第 2、4 次：改用窗口消息点击
+                self.post_hover(acc[0], acc[1])
+                self.post_click(acc[0], acc[1], f"UU：立即加速（第 {n} 次）")
+            else:
+                self.click_screen(acc, f"UU：立即加速（第 {n} 次）")
         self.save_click_shot(acc, "uu_tile")
         self.wait(1.5)
-        # 把鼠标移开（停在封面上会一直是悬停的样子），再看封面有没有变暗转圈 / 换成详情页
-        pyautogui.moveTo(c["label"][0], int(c["label"][1] + 0.22 * c["W"]), duration=random.uniform(0.5, 0.8))
         end = time.time() + 12
         while time.time() < end and not self.stop_evt.is_set():
             self.wait(1.5)
@@ -1935,8 +2258,24 @@ class Bot(threading.Thread):
                     return True    # 首页的封面不见了：已经换到加速详情页
         return False
 
+    def check_uu_admin(self):
+        """UU 是管理员权限、本程序不是的话，Windows 会挡掉模拟的鼠标（悬停、点击都没反应）。"""
+        if is_admin():
+            return
+        hw = find_uu_window()
+        if not hw:
+            return
+        try:
+            pid = win32process.GetWindowThreadProcessId(hw)[1]
+        except Exception:
+            return
+        if process_elevated(pid):
+            self.log("UU 加速器是以管理员身份运行的，本程序不是：Windows 会挡掉模拟的鼠标操作，"
+                     "所以鼠标移过去也不会出现「立即加速」。请到「设置」打开「以管理员身份运行本程序」", "err")
+
     def launch_by_uu(self):
         """UU 加速器：悬停封面 → 点「立即加速」→ 确认开始加速 → 点青色的「启动游戏」。"""
+        self.check_uu_admin()
         deadline = time.time() + 300
         last_report = time.time()
         accel_ok = False
@@ -1989,7 +2328,9 @@ class Bot(threading.Thread):
                              "可以发给作者看", "err")
                     return False
                 self.state_text = "UU：点「立即加速」…"
-                r = self.uu_accelerate(region, est, tries + 1)
+                r = self.uu_accelerate_mygames(region, est, tries + 1)
+                if r is None:   # 「我的游戏」里找不到赛马娘：改用首页的封面
+                    r = self.uu_accelerate(region, est, tries + 1)
                 if r == "detail":
                     accel_ok = True
                     accel_at = time.time()
@@ -2511,6 +2852,7 @@ class App:
         self.v_cycle_timeout = tk.IntVar(value=self.cfg["cycle_timeout"])
         self.v_cycle_now = tk.BooleanVar(value=self.cfg["cycle_run_now"])
         self.v_wait_training = tk.BooleanVar(value=self.cfg.get("wait_training", True))
+        self.v_admin = tk.BooleanVar(value=self.cfg.get("run_as_admin", False))
         self.v_key_start = tk.StringVar(value=self.cfg.get("hotkey_start", "F9"))
         self.v_key_stop = tk.StringVar(value=self.cfg.get("hotkey_stop", "F10"))
         self.v_tp_drink = tk.BooleanVar(value=self.cfg["tp_auto_drink"])
@@ -3196,6 +3538,10 @@ class App:
                        variable=self.v_min_others, bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
         tb.Checkbutton(box, text="点击位置在按钮范围内随机、点击速度随机",
                        variable=self.v_humanize, bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
+        tb.Checkbutton(box, text="以管理员身份运行本程序（UU 加速器要求管理员权限时需要打开）",
+                       variable=self.v_admin, bootstyle="warning-round-toggle",
+                       command=self.on_admin_toggle).pack(anchor=W, pady=(6, 0))
+        tb.Label(box, text="现在：" + ("管理员身份 ✓" if is_admin() else "一般身份"), bootstyle="secondary").pack(anchor=W, padx=(48, 0))
         tb.Button(box, text="保存设置", bootstyle="success", command=self.save_settings).pack(anchor=W, pady=(12, 0))
 
         lb = tb.Labelframe(f, text="自动启动游戏（加速器）", padding=14)
@@ -3401,6 +3747,7 @@ class App:
                 cycle_timeout=int(self.v_cycle_timeout.get()),
                 cycle_run_now=bool(self.v_cycle_now.get()),
                 wait_training=bool(self.v_wait_training.get()),
+                run_as_admin=bool(self.v_admin.get()),
                 hotkey_start=self.v_key_start.get() or "无",
                 hotkey_stop=self.v_key_stop.get() or "无",
                 tp_auto_drink=bool(self.v_tp_drink.get()),
@@ -3815,6 +4162,16 @@ class App:
             self.refresh_fans()
         self.root.after(200, self.poll)
 
+    def on_admin_toggle(self):
+        self.save_settings(quiet=True)
+        if self.v_admin.get() and not is_admin():
+            if messagebox.askyesno(APP_NAME, "要现在以管理员身份重新打开程序吗？\n（Windows 会跳出确认窗口，点「是」）"):
+                self.stop()
+                if relaunch_as_admin():
+                    self.root.after(200, self.root.destroy)
+                else:
+                    messagebox.showwarning(APP_NAME, "没有切换成管理员身份（可能在确认窗口点了「否」）")
+
     # ---------- 更新公告 ----------
     def maybe_show_whats_new(self):
         """版本号跟上次打开时不一样（刚更新完）就弹出这次更新的内容。"""
@@ -4046,6 +4403,15 @@ def fit_window(root):
 
 
 if __name__ == "__main__":
+    # 设置里开了「以管理员身份运行」：不是管理员就用管理员身份重开自己
+    try:
+        if load_cfg().get("run_as_admin") and not is_admin() and "--elevated" not in sys.argv \
+                and relaunch_as_admin():
+            sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
     app_root = make_window()
     App(app_root)
     fit_window(app_root)
