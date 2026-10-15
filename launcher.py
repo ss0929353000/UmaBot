@@ -9,6 +9,13 @@ import shutil
 import sys
 import traceback
 
+# pyautogui 一载入就会把程序设成「系统 DPI」模式；先设成每个屏幕各自的缩放，坐标才不会被换算错
+try:
+    import ctypes as _ct
+    _ct.windll.user32.SetProcessDpiAwarenessContext(_ct.c_void_p(-4))
+except Exception:
+    pass
+
 # ---- 下面这些 import 是给 PyInstaller 看的：程序代码要用的库都要先打包进 exe ----
 import base64, csv, ctypes, glob, hashlib, io, json, math, queue, random, ssl, struct  # noqa: E401,F401
 import subprocess, tempfile, threading, time, urllib.request, urllib.error, webbrowser, zipfile  # noqa: E401,F401

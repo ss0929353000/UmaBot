@@ -5,6 +5,7 @@ state.json
 *.csv
 crash.log
 debug/
+logs/
 # 打包产物
 build/
 dist/

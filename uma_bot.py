@@ -44,14 +44,70 @@ try:  # 高 DPI 坐标修正
 except Exception:
     pass
 
+
+def client_rect_physical(hwnd):
+    """在界面线程里也用真实像素取得窗口位置（取完换回原本的模式，不影响界面）。"""
+    prev = None
+    try:
+        prev = ctypes.windll.user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        pass
+    try:
+        return client_rect(hwnd), grab(client_rect(hwnd))
+    finally:
+        if prev:
+            try:
+                ctypes.windll.user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(prev))
+            except Exception:
+                pass
+
+
+def set_thread_dpi_aware():
+    """让这个线程用真实像素坐标（每个屏幕各自的缩放）。
+    pyautogui 一载入就把程序设成「系统 DPI」模式，Windows 缩放改过又没重新登录时，
+    窗口位置、大小会被 Windows 换算错，截到的游戏画面就会偏掉；线程层级的设置可以把它改回来。"""
+    try:
+        ctypes.windll.user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
+    except Exception:
+        try:
+            ctypes.windll.user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-3))  # PER_MONITOR_AWARE
+        except Exception:
+            pass
+
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.12"
+VERSION = "3.19"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.19", "2026-10-15", [
+        "调整：取消「提前几分钟启动游戏」，改成育成结束后 0～2 分钟内随机的时间才动作（关游戏模式下这时才打开游戏）",
+    ]),
+    ("3.18", "2026-10-15", [
+        "修正：Windows 显示缩放跟登录时不同（或远程连线改了缩放）时，截到的游戏画面会偏掉、整个认不出，"
+        "一直点「标题画面」的问题",
+    ]),
+    ("3.17", "2026-10-15", [
+        "修正：游戏窗口比较小或横向时，已经在主页还一直点「标题画面」的问题：认不出主页时会自动修正按钮缩放",
+    ]),
+    ("3.16", "2026-10-15", [
+        "调整：日志存档改成纯文字 .txt（每天一个），用记事本就能打开；成功 ✓、警告 !、错误 ✗、萝卜 ★ 用符号标出",
+        "调整：取消彩色 .html 存档，之前产生的会自动删掉，旧的 .log 会转成 .txt",
+    ]),
+    ("3.15", "2026-10-15", [
+        "新增：日志存档多存一份彩色的 .html",
+    ]),
+    ("3.14", "2026-10-14", [
+        "调整：运行日志关掉程序不会清空，重开会接着显示今天的记录；过了凌晨 4 点才归零",
+        "新增：日志每天存一个文件在 logs 文件夹，点「日志存档」可以查看以前的记录",
+        "新增：彩色萝卜增加的那一行用彩色字显示",
+    ]),
+    ("3.13", "2026-10-14", [
+        "新增：粉丝达标停止后可以自动关闭游戏、自动关机（「运行」页粉丝目标下面的两个开关）",
+        "关机前会倒数 60 秒并弹出窗口，可以点「取消关机」",
+    ]),
     ("3.12", "2026-10-13", [
         "调整：UU 加速改成从首页右下角「我的游戏」进去，找到赛马娘卡片再点「立即加速」",
     ]),
@@ -112,6 +168,7 @@ BASE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", 
 TPL_DIR = os.path.join(BASE, "templates")
 CFG_PATH = os.path.join(BASE, "config.json")
 FANS_PATH = os.path.join(BASE, "fans.json")
+LOG_DIR = os.path.join(BASE, "logs")   # 运行日志存档：每天一个文件（凌晨 4 点算新的一天）
 DRINK_SAFETY_CAP = 5  # 每轮喝体力饮料的安全上限（防认错画面一直喝），正常一轮只会喝一瓶
 JEWEL_RESET_HOUR = 4  # 萝卜的「一天」从凌晨 4 点算起（和游戏每日刷新一致）
 
@@ -236,7 +293,6 @@ DEFAULT_CFG = {
     "uu_path": "",             # 加速器（或游戏启动器）的位置
     "game_path": "",           # DMM 游戏快捷方式
     "acc_order": [],           # 其他加速器：要依序点的按钮
-    "launch_lead": 5,          # 提前几分钟启动游戏
     "launch_wait": 5,          # 启动后最多等几分钟进入主页
     "auto_focus": False,
     "mode": "auto_cycle",
@@ -254,6 +310,8 @@ DEFAULT_CFG = {
     "fan_goal_on": False,      # 粉丝达到目标就不再开始新育成
     "fan_goal_wan": 1000,      # 目标粉丝数（单位：万）
     "fan_goal_scope": "today",  # today＝今天累计；run＝这次按启动后累计
+    "goal_close_game": False,  # 粉丝达标停止后关闭游戏
+    "goal_shutdown": False,    # 粉丝达标停止后关机（60 秒倒数，可取消）
     "story_max_episodes": 0,
     "story_max_scroll": 5,
     "story_new_region": None,
@@ -288,6 +346,48 @@ PALETTE = {
 }
 GOLD = "#e3c46b"
 LOG_BG = "#17251e"
+RAINBOW = ["#ff6b6b", "#ffa94d", "#ffd43b", "#69db7c", "#4dabf7", "#9775fa", "#f783ac"]
+# 日志存档（纯文字 .txt）：每行「时间  标记 内容」，标记让程序重开时还原颜色
+LOG_MARK = {"ok": "✓ ", "warn": "! ", "err": "✗ ", "jewel": "★ "}
+
+
+def log_txt_line(ts, level, msg):
+    return f"{ts}  {LOG_MARK.get(level, '')}{msg}\n"
+
+
+def parse_log_txt_line(ln):
+    """「23:17:50  ★ 本轮宝石…」→ (时间, 等级, 内容)。"""
+    if len(ln) < 10 or ln[2] != ":" or ln[5] != ":":
+        return None
+    ts, rest = ln[:8], ln[8:].lstrip(" ")
+    for lv, mk in LOG_MARK.items():
+        if rest.startswith(mk):
+            return ts, lv, rest[len(mk):]
+    return ts, "info", rest
+
+
+def migrate_logs():
+    """旧版本的存档（.log、.html）整理成 .txt。"""
+    try:
+        names = os.listdir(LOG_DIR)
+    except Exception:
+        return
+    for fn in names:
+        p = os.path.join(LOG_DIR, fn)
+        try:
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.html", fn):
+                os.remove(p)
+            elif re.fullmatch(r"\d{4}-\d{2}-\d{2}\.log", fn):
+                dst = p[:-4] + ".txt"
+                with open(p, encoding="utf-8") as f:
+                    rows = [ln.split("\t", 2) for ln in f.read().splitlines()]
+                with open(dst, "a", encoding="utf-8") as f:
+                    for r in rows:
+                        if len(r) == 3:
+                            f.write(log_txt_line(*r))
+                os.remove(p)
+        except Exception:
+            pass
 
 
 def load_cfg():
@@ -948,6 +1048,8 @@ class Bot(threading.Thread):
         self.run_drinks = 0   # 这次按启动后一共喝了几瓶体力饮料
         self.hung_since = None
         self.recoveries = 0
+        self.scale_fix = 1.0   # 游戏画面比例跟截模板时不一样时，自动修正的缩放
+        self.calib_at = 0.0
         self.next_label = "下次执行"
         self.uu_scale = None
         self.last_match = None
@@ -1009,10 +1111,35 @@ class Bot(threading.Thread):
     def prepare(self, full_h):
         """按窗口高度准备模板：识别用缩小版，萝卜图标保留原尺寸版。"""
         self.f = min(1.0, WORK_H / full_h) if full_h else 1.0
-        self.tpls = prepare_templates(round(full_h * self.f), self.cfg)
-        self.jewel_icon_full = prepare_templates(full_h, self.cfg).get("flow_jewel")
+        k = getattr(self, "scale_fix", 1.0)
+        self.tpls = prepare_templates(round(full_h * self.f * k), self.cfg)
+        self.jewel_icon_full = prepare_templates(round(full_h * k), self.cfg).get("flow_jewel")
         self.prep_h = full_h
         self.jewel_scale = None
+
+    def calibrate(self, img):
+        """主页「育成」按钮按原本的缩放认不出时，试试放大缩小一点；认出来就把所有模板改用这个缩放。
+        （游戏窗口太小、横向模式、或 Windows 缩放跟截模板时不同，画面上的按钮会比模板大一点或小一点）"""
+        if time.time() - self.calib_at < 20 or "flow_home" not in self.tpls:
+            return False
+        self.calib_at = time.time()
+        base = self.tpls["flow_home"]
+        cur = getattr(self, "scale_fix", 1.0)
+        best = (0.0, 1.0)
+        for d in (-0.12, -0.09, -0.06, -0.03, 0.03, 0.06, 0.09, 0.12):
+            s = 1 + d
+            t = cv2.resize(base, (max(1, round(base.shape[1] * s)), max(1, round(base.shape[0] * s))),
+                           interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+            _, sc = match(img, t, 0.99)
+            if sc > best[0]:
+                best = (sc, s)
+        if best[0] < 0.85:
+            return False
+        self.scale_fix = cur * best[1]
+        self.log(f"游戏画面的按钮比模板{'大' if best[1] > 1 else '小'} {abs(best[1] - 1) * 100:.0f}%，"
+                 f"已自动修正（相似度 {best[0]:.2f}）", "ok")
+        self.prepare(self.prep_h)
+        return True
 
     def capture(self):
         hwnd = self.ensure_active()
@@ -1084,6 +1211,7 @@ class Bot(threading.Thread):
         return changed
 
     def run(self):
+        set_thread_dpi_aware()
         try:
             self.main()
         except pyautogui.FailSafeException:
@@ -1401,7 +1529,7 @@ class Bot(threading.Thread):
                     jewels = None
                     r["jewels_after"] = None
                 else:
-                    self.log(f"本轮宝石（彩色萝卜）{r['jewels_before']:,} → {r['jewels_after']:,}，增加 {jewels:+,}", "ok")
+                    self.log(f"本轮宝石（彩色萝卜）{r['jewels_before']:,} → {r['jewels_after']:,}，增加 {jewels:+,}", "jewel")
             elif self.stop_evt.is_set():
                 pass  # 手动停止，不提示
             elif "flow_jewel" in self.tpls:
@@ -1641,6 +1769,24 @@ class Bot(threading.Thread):
         self.state_text = None
         return False
 
+    SHUTDOWN_DELAY = 60  # 关机前倒数几秒（这段时间可以按「取消关机」）
+
+    def goal_finish(self):
+        """粉丝达标后：按设置关闭游戏、关机。"""
+        if self.cfg.get("goal_close_game") or self.cfg.get("goal_shutdown"):
+            if find_window(self.cfg["window_title"]):
+                self.close_game("粉丝已达标，关闭游戏")
+        if self.cfg.get("goal_shutdown"):
+            try:
+                import subprocess
+                subprocess.run(["shutdown", "/s", "/t", str(self.SHUTDOWN_DELAY), "/c",
+                                f"赛马娘助手：粉丝已达标，{self.SHUTDOWN_DELAY} 秒后关机"],
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=15)
+                self.shutdown_at = time.time() + self.SHUTDOWN_DELAY
+                self.log(f"{self.SHUTDOWN_DELAY} 秒后关机。不想关机的话，在弹出的窗口点「取消关机」", "warn")
+            except Exception as e:
+                self.log(f"关机指令执行失败：{e}", "err")
+
     def cycle_loop(self):
         auto = self.cfg.get("auto_launch")
         while not self.stop_evt.is_set():
@@ -1649,17 +1795,18 @@ class Bot(threading.Thread):
                 scope = "这次启动后" if self.cfg.get("fan_goal_scope") == "run" else "今天"
                 self.log(f"{scope}粉丝已经达到目标 {fmt_fans(goal)}，不再开始新育成，已停止", "ok")
                 self.state_text = "粉丝已达标，已停止"
+                self.goal_finish()
                 self.stop_evt.set()
                 return
             first = self.cycles == 0
             if not (first and self.cfg["cycle_run_now"]):
-                target = time.time() + self.cfg["cycle_minutes"] * 60
+                # 育成结束的时间再随机晚 0～2 分钟才动作，不要每次都卡在同一秒
+                target = time.time() + self.cfg["cycle_minutes"] * 60 + random.uniform(0, 120)
                 if auto and not find_window(self.cfg["window_title"]):
-                    lead = max(1, self.cfg.get("launch_lead", 5)) * 60
-                    if not self.countdown_until(target - lead, "启动游戏"):
+                    if not self.countdown_until(target, "启动游戏"):
                         return
                     self.launch_game()
-                if not self.countdown_until(target):
+                elif not self.countdown_until(target):
                     return
             elif auto and not find_window(self.cfg["window_title"]):
                 self.launch_game()
@@ -1671,6 +1818,7 @@ class Bot(threading.Thread):
             if self.goal_hit and not self.stop_evt.is_set():
                 self.log(f"{self.goal_hit}，这次育成的奖励已领完，不再开始新育成，已停止", "ok")
                 self.state_text = "粉丝已达标，已停止"
+                self.goal_finish()
                 self.stop_evt.set()
                 return
             if ok:
@@ -2505,6 +2653,8 @@ class Bot(threading.Thread):
             if self.find(img, "flow_home") or self.find(img, "flow_home_running"):
                 self.log("已进入主页", "ok")
                 return True
+            if self.calibrate(img):   # 其实已经在主页，只是按钮大小对不上
+                continue
             for k in keys:
                 pt = self.find(img, k)
                 if pt:
@@ -2521,12 +2671,12 @@ class Bot(threading.Thread):
             self.log("启动后一直没进入主页，可能卡在没见过的画面。可新增 boot_ 开头的模板", "warn")
         return False
 
-    def close_game(self):
+    def close_game(self, msg="本轮完成，关闭游戏，下一轮前再自动启动"):
         """先正常关闭游戏窗口，关不掉再强制结束。"""
         hwnd = find_window(self.cfg["window_title"])
         if not hwnd:
             return
-        self.log("本轮完成，关闭游戏，下一轮前再自动启动")
+        self.log(msg)
         try:
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
         except Exception:
@@ -2860,6 +3010,9 @@ class App:
         self.v_tp_jewel_max = tk.IntVar(value=self.cfg.get("tp_max_jewel", 1))
         self.v_goal_on = tk.BooleanVar(value=self.cfg.get("fan_goal_on", False))
         self.v_goal_wan = tk.DoubleVar(value=self.cfg.get("fan_goal_wan", 1000))
+        self.v_goal_close = tk.BooleanVar(value=self.cfg.get("goal_close_game", False))
+        self.v_goal_shutdown = tk.BooleanVar(value=self.cfg.get("goal_shutdown", False))
+        self.shutdown_win = None
         self.v_goal_scope = tk.StringVar(value="这次启动后" if self.cfg.get("fan_goal_scope") == "run" else "今天累计")
         self.v_story_max = tk.IntVar(value=self.cfg["story_max_episodes"])
         self.v_story_scroll = tk.IntVar(value=self.cfg["story_max_scroll"])
@@ -2874,7 +3027,6 @@ class App:
         self.v_uu_path = tk.StringVar(value=self.cfg.get("uu_path", ""))
         self.v_game_path = tk.StringVar(value=self.cfg.get("game_path", ""))
         self.v_dmm_only = tk.BooleanVar(value=self.cfg.get("dmm_only", False))
-        self.v_launch_lead = tk.IntVar(value=self.cfg.get("launch_lead", 5))
         self.v_launch_wait = tk.IntVar(value=self.cfg.get("launch_wait", 5))
         self.v_auto_update = tk.BooleanVar(value=self.cfg.get("auto_update", True))
         self.updating = False
@@ -2904,6 +3056,9 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         if pynput_kb:
             pynput_kb.Listener(on_press=self.on_key).start()
+        self.log_day = FanStore.day_of(datetime.now(), JEWEL_RESET_HOUR)
+        migrate_logs()
+        self.load_today_log()
         self.log(f"{APP_NAME} v{VERSION} 已就绪")
         root.after(900, self.maybe_show_whats_new)
         if self.cfg.get("auto_update", True):
@@ -3032,6 +3187,12 @@ class App:
         tb.Spinbox(gr, from_=1, to=999999, increment=100, textvariable=self.v_goal_wan, width=7).pack(side=RIGHT)
         self.lbl_goal = tb.Label(self.box_cycle, text="", bootstyle="secondary")
         self.lbl_goal.pack(anchor=W)
+        gx = tb.Frame(self.box_cycle)
+        gx.pack(anchor=W, pady=(4, 0))
+        tb.Checkbutton(gx, text="达标后关闭游戏", variable=self.v_goal_close,
+                       bootstyle="success-round-toggle").pack(side=LEFT)
+        tb.Checkbutton(gx, text="达标后关机", variable=self.v_goal_shutdown,
+                       bootstyle="danger-round-toggle", command=self.on_shutdown_toggle).pack(side=LEFT, padx=(14, 0))
         self.v_goal_scope.trace_add("write", lambda *a: self.refresh_goal())
         self.v_goal_wan.trace_add("write", lambda *a: self.refresh_goal())
         self.box_story = tb.Labelframe(holder, text="剧情", padding=12)
@@ -3102,6 +3263,7 @@ class App:
         tb.Checkbutton(bar, text="自动滚到最新", variable=self.v_autoscroll,
                        bootstyle="info-round-toggle").pack(side=LEFT)
         tb.Button(bar, text="清空", bootstyle="secondary-outline", width=6, command=self.clear_log).pack(side=RIGHT)
+        tb.Button(bar, text="日志存档", bootstyle="secondary-outline", command=self.open_log_dir).pack(side=RIGHT, padx=(0, 6))
         tf = tb.Frame(lf)
         tf.pack(fill=BOTH, expand=True)
         self.txt = tk.Text(tf, bg=LOG_BG, fg="#f1ead6", relief="flat", font=(FONT, 10), wrap="word",
@@ -3115,6 +3277,9 @@ class App:
         self.txt.tag_configure("ok", foreground="#8ed9a4")
         self.txt.tag_configure("warn", foreground=GOLD)
         self.txt.tag_configure("err", foreground="#ff8a80")
+        self.txt.tag_configure("sep", foreground="#6f8577", justify="center")
+        for i, c in enumerate(RAINBOW):   # 萝卜那一行：每个字不同颜色
+            self.txt.tag_configure(f"rb{i}", foreground=c, font=(FONT, 10, "bold"))
 
     def build_emblem(self, parent):
         """左下角的装饰徽章：金边祖母绿钻石与金色皇冠。"""
@@ -3565,8 +3730,8 @@ class App:
         self.lbl_acc = tb.Label(lb, text="", bootstyle="secondary", justify=LEFT)
         self.lbl_acc.pack(anchor=W, pady=(6, 4))
         self.refresh_acc_hint()
-        self.row(lb, "提前几分钟启动游戏",
-                 lambda p: tb.Spinbox(p, from_=1, to=30, textvariable=self.v_launch_lead, width=7))
+        tb.Label(lb, text="游戏会在育成结束后 0～2 分钟内（随机）打开，进到主页就接着结束并重开育成",
+                 bootstyle="secondary").pack(anchor=W, pady=(2, 4))
         self.row(lb, "启动后最多等几分钟进入主页",
                  lambda p: tb.Spinbox(p, from_=1, to=15, textvariable=self.v_launch_wait, width=7))
         tb.Button(lb, text="测试：关闭并自动启动一次", bootstyle="info-outline",
@@ -3755,6 +3920,8 @@ class App:
                 tp_max_jewel=int(self.v_tp_jewel_max.get()),
                 fan_goal_on=bool(self.v_goal_on.get()),
                 fan_goal_wan=float(self.v_goal_wan.get()),
+                goal_close_game=bool(self.v_goal_close.get()),
+                goal_shutdown=bool(self.v_goal_shutdown.get()),
                 fan_goal_scope="run" if self.v_goal_scope.get() == "这次启动后" else "today",
                 story_max_episodes=int(self.v_story_max.get()),
                 story_max_scroll=int(self.v_story_scroll.get()),
@@ -3769,7 +3936,6 @@ class App:
                 uu_path=self.v_uu_path.get().strip().strip('"'),
                 game_path=self.v_game_path.get().strip().strip('"'),
                 dmm_only=bool(self.v_dmm_only.get()),
-                launch_lead=int(self.v_launch_lead.get()),
                 launch_wait=int(self.v_launch_wait.get()),
                 auto_update=bool(self.v_auto_update.get()),
             )
@@ -3931,8 +4097,7 @@ class App:
         self.root.iconify()
 
         def do():
-            rect = client_rect(hwnd)
-            img = grab(rect)
+            rect, img = client_rect_physical(hwnd)
             self.root.deiconify()
             then(img, list(rect[2:]))
 
@@ -4128,17 +4293,75 @@ class App:
         self.log_q.put((time.strftime("%H:%M:%S"), level, msg))
 
     def clear_log(self):
+        """只清空画面；存档文件不会删，点「日志存档」还看得到。"""
         self.txt.configure(state=NORMAL)
         self.txt.delete("1.0", "end")
         self.txt.configure(state=DISABLED)
 
+    @staticmethod
+    def log_path(day):
+        return os.path.join(LOG_DIR, f"{day.isoformat()}.txt")
+
+    def write_log_file(self, ts, level, msg):
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(self.log_path(self.log_day), "a", encoding="utf-8") as f:
+                f.write(log_txt_line(ts, level, msg.replace(chr(10), " ")))
+        except Exception:
+            pass
+
+    def render_log_line(self, ts, level, msg):
+        self.txt.insert("end", ts + "  ", "time")
+        if level == "jewel":
+            for i, ch in enumerate(msg):
+                self.txt.insert("end", ch, f"rb{i % len(RAINBOW)}")
+            self.txt.insert("end", "\n")
+        else:
+            self.txt.insert("end", msg + "\n", level if level in ("info", "ok", "warn", "err") else "info")
+
+    def load_today_log(self):
+        """重新打开程序时，把今天（凌晨 4 点以后）的日志读回来。"""
+        try:
+            with open(self.log_path(self.log_day), encoding="utf-8") as f:
+                lines = f.read().splitlines()[-1500:]
+        except Exception:
+            return
+        if not lines:
+            return
+        self.txt.configure(state=NORMAL)
+        for ln in lines:
+            parts = parse_log_txt_line(ln)
+            if parts:
+                self.render_log_line(*parts)
+        self.txt.insert("end", "──── 程序重新打开 ────\n", "sep")
+        self.txt.configure(state=DISABLED)
+        self.txt.see("end")
+
+    def check_log_day(self):
+        """过了凌晨 4 点：画面上的日志归零，旧的留在存档里。"""
+        day = FanStore.day_of(datetime.now(), JEWEL_RESET_HOUR)
+        if day == self.log_day:
+            return
+        old = self.log_day
+        self.log_day = day
+        self.clear_log()
+        self.log(f"新的一天开始，昨天的日志已存到 logs\\{old.isoformat()}.txt（点「日志存档」可以查看）")
+
+    def open_log_dir(self):
+        os.makedirs(LOG_DIR, exist_ok=True)
+        try:
+            os.startfile(LOG_DIR)
+        except Exception as e:
+            messagebox.showinfo(APP_NAME, f"日志存档在：{LOG_DIR}\n（{e}）")
+
     def poll(self):
+        self.check_log_day()
         if not self.log_q.empty():
             self.txt.configure(state=NORMAL)
             while not self.log_q.empty():
                 ts, level, msg = self.log_q.get()
-                self.txt.insert("end", ts + "  ", "time")
-                self.txt.insert("end", msg + "\n", level)
+                self.write_log_file(ts, level, msg)
+                self.render_log_line(ts, level, msg)
             if int(self.txt.index("end-1c").split(".")[0]) > 2000:
                 self.txt.delete("1.0", "500.0")
             self.txt.configure(state=DISABLED)
@@ -4146,6 +4369,8 @@ class App:
                 self.txt.see("end")
 
         self.handle_hotkeys()
+        if self.bot and getattr(self.bot, "shutdown_at", None) and not self.shutdown_win:
+            self.show_shutdown_window(self.bot.shutdown_at)
         if self.bot and not self.bot.is_alive():
             self.bot = None
             self.set_running(False)
@@ -4171,6 +4396,56 @@ class App:
                     self.root.after(200, self.root.destroy)
                 else:
                     messagebox.showwarning(APP_NAME, "没有切换成管理员身份（可能在确认窗口点了「否」）")
+
+    # ---------- 达标后关机 ----------
+    def on_shutdown_toggle(self):
+        if self.v_goal_shutdown.get():
+            messagebox.showinfo(APP_NAME, "粉丝达到目标后，会先关闭游戏，再倒数 60 秒关机。\n"
+                                          "倒数时会弹出窗口，可以点「取消关机」。\n\n"
+                                          "要记得先打开上面的「粉丝达到目标就停止」并设好目标。")
+        self.save_settings(quiet=True)
+
+    def show_shutdown_window(self, at):
+        win = tb.Toplevel(self.root)
+        self.shutdown_win = win
+        win.title(f"{APP_NAME}  即将关机")
+        win.attributes("-topmost", True)
+        f = tb.Frame(win, padding=24)
+        f.pack(fill=BOTH, expand=True)
+        tb.Label(f, text="粉丝已达标，即将关机", font=(FONT, 14, "bold"), foreground=PALETTE["danger"]).pack()
+        lbl = tb.Label(f, text="", font=(FONT, 11))
+        lbl.pack(pady=(10, 16))
+
+        def cancel():
+            try:
+                import subprocess
+                subprocess.run(["shutdown", "/a"], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=15)
+                self.log("已取消关机", "ok")
+            except Exception as e:
+                self.log(f"取消关机失败：{e}", "err")
+            win.destroy()
+
+        tb.Button(f, text="取消关机", bootstyle="danger", width=14, command=cancel).pack()
+
+        def tick():
+            if not win.winfo_exists():
+                return
+            left = int(at - time.time())
+            lbl.configure(text=f"{max(0, left)} 秒后关机")
+            if left > -5:
+                win.after(500, tick)
+
+        tick()
+        win.update_idletasks()
+        x = self.root.winfo_screenwidth() // 2 - win.winfo_reqwidth() // 2
+        y = self.root.winfo_screenheight() // 3
+        win.geometry(f"+{x}+{y}")
+        try:
+            self.root.deiconify()
+        except Exception:
+            pass
+        win.lift()
+        win.focus_force()
 
     # ---------- 更新公告 ----------
     def maybe_show_whats_new(self):
