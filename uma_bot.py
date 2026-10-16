@@ -78,10 +78,16 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.19"
+VERSION = "3.21"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.21", "2026-10-16", [
+        "新手教程：截模板的部分改成 6 页，一步一步教怎么截、每个按钮在哪个画面、怎么检查有没有截好",
+    ]),
+    ("3.20", "2026-10-16", [
+        "新增：新手教程（上方「？ 新手教程」按钮），一步一步带你设好模板、定时、粉丝目标、自动启动；第一次打开会自动显示",
+    ]),
     ("3.19", "2026-10-15", [
         "调整：取消「提前几分钟启动游戏」，改成育成结束后 0～2 分钟内随机的时间才动作（关游戏模式下这时才打开游戏）",
     ]),
@@ -2986,6 +2992,121 @@ def restart_program():
     subprocess.Popen(args, cwd=BASE, env=env, close_fds=True)
 
 
+# ================= 新手教程 =================
+# 每一步：(标题, 内容, 切到哪个分页：0 运行 / 1 育成收益 / 2 模板 / 3 设置 / 4 打赏 / None 不切)
+TUTORIAL = [
+    ("欢迎使用赛马娘助手", (
+        "这个软件会帮你挂机游戏内置的「自主训练养成」：\n\n"
+        "◆ 每隔一段时间（默认 50 分钟）自动结束育成、领奖励，再开一轮新的\n"
+        "◆ TP 不够时自动喝体力饮料\n"
+        "◆ 记录每天拿到多少粉丝和彩色萝卜\n"
+        "◆ 可以自动关游戏、自动用加速器 / DMM 重新打开\n\n"
+        "它是看游戏画面、模拟鼠标点击来操作的，不会改游戏文件。\n"
+        "接下来几步带你把它设好，大约 3 分钟。"), None),
+    ("第 1 步：准备游戏", (
+        "1. 打开赛马娘，用「窗口模式」（不要全屏）。\n"
+        "2. 在游戏里先手动开好一轮「自主训练养成」，然后回到主页。\n"
+        "3. 截完模板之后，不要再改游戏窗口大小和 Windows 的显示缩放，"
+        "不然按钮会认不出来。\n\n"
+        "小提醒：使用第三方工具有被游戏处罚的风险，请自行判断。"), None),
+    ("第 2 步：截模板（1/6）模板是什么", (
+        "软件是「看图找按钮」：每个要点的按钮，都要先存一张它的截图，叫做「模板」。\n\n"
+        "◆ 完整版（UmaBot.zip）已经内置好模板，可以直接跳到「第 2 步（6/6）」检查。\n"
+        "◆ 从 GitHub 下载的版本不附游戏截图，要照下面几页自己截一次。\n\n"
+        "现在已经切到「模板」页：列表分成几组，每一行有\n"
+        "◆ 模板名：程序用的名字（例如 flow_home）\n"
+        "◆ 要框的内容：这个模板要框游戏里的哪个按钮\n"
+        "◆ 状态：「✓ 已截取」或「✗ 未截取」"), 2),
+    ("第 2 步：截模板（2/6）截一张的做法", (
+        "每一个模板都是同样 5 个动作：\n\n"
+        "1. 在游戏里走到「有这个按钮」的画面，先不要点它。\n"
+        "2. 回到助手的「模板」页，在列表里点一下那一行（例如 flow_home）。\n"
+        "3. 按列表下面的「截取」。助手会先缩小，截一张游戏画面。\n"
+        "4. 弹出的截图里，按住鼠标左键拖一个框把按钮框起来，放开就存好了（按 Esc 取消）。\n"
+        "5. 列表那一行变成「✓ 已截取」就完成，接着截下一个。\n\n"
+        "框的诀窍：\n"
+        "◆ 只框按钮上的文字和图标，框紧一点，但要完整。\n"
+        "◆ 不要框到会变的东西：数字、人物、闪光特效、背景。\n"
+        "◆ 截错了就选中那一行再按一次「截取」，会直接覆盖。\n"
+        "◆ 全部截完以后，不要再改游戏窗口大小。"), 2),
+    ("第 2 步：截模板（3/6）必截的 4 个", (
+        "这 4 个截好就能启动（「运行」页的「模板准备」会显示 4/4）：\n\n"
+        "◆ flow_home：游戏主页右下角的「育成」大按钮。在主页截，只框「育成」两个字。\n"
+        "◆ flow_next：按「育成」进去后，选剧本 / 选马娘画面下方的「下项」。\n"
+        "◆ flow_ikusei_start：一路按「下项」到最后确认页的「育成开始！」。\n"
+        "◆ flow_auto_start：按下「育成开始！」后出现的「自主训练养成开始！」按钮。\n\n"
+        "小技巧：手动开一轮育成，每走到一个画面就先截再点，这 4 个一次就能截完。"), 2),
+    ("第 2 步：截模板（4/6）开始流程的其他按钮", (
+        "这些建议也截，遇到时程序才会处理（没截到的步骤会被跳过）：\n\n"
+        "◆ flow_home_running：自主训练进行中时，主页「育成」上方的「自主训练中」标记。\n"
+        "◆ flow_ok / flow_close / flow_decide：途中跳出来的「OK」「关闭」「决定」。\n"
+        "◆ flow_tp_recover：TP 不够时跳出的「回复」。\n"
+        "◆ flow_tp_drink：回复清单里「体力饮料(30)」那一行的名字（不要框数量）。\n"
+        "◆ flow_tp_use：那一行右边的「使用」。\n"
+        "◆ flow_tp_jewel：回复清单里「宝石」那一行的名字（要用宝石回复才需要）。\n"
+        "◆ flow_running：自主训练画面底部的「自主トレ中」。\n"
+        "◆ flow_menu / flow_menu_home：自主训练画面右下角的菜单、菜单里的「返回主页」。\n"
+        "◆ flow_jewel：主页顶部栏的彩色萝卜图标，只框图标，不要框数字。"), 2),
+    ("第 2 步：截模板（5/6）结束流程的按钮", (
+        "等一轮自主训练跑完再截。时间到后手动走一次，每个画面先截再点：\n\n"
+        "◆ end_go：主页或育成画面的「前往育成」。\n"
+        "◆ end_finish_btn：「育成完成！」。\n"
+        "◆ end_finish：结束确认里的「结束」（不要截「重新获得因子」）。\n"
+        "◆ end_factor_ok / end_confirm：「确定因子」，以及接着跳出的「确定」。\n"
+        "◆ end_fans：获得奖励画面「获得粉丝总数」这几个字（用来记录粉丝）。\n"
+        "◆ end_next / end_next_b：领奖、结算画面的「下项」，只框按钮左半边，避开右边的闪光圈。\n"
+        "◆ end_close：赛马娘信息的「关闭」。\n"
+        "◆ end_again：最后的「再次育成」。\n"
+        "◆ err_3d（可选）：遇到「3D资源读取失败。」弹窗时截那行字，之后看到就会自动重开游戏。"), 2),
+    ("第 2 步：截模板（6/6）检查有没有截好", (
+        "1. 让游戏停在某个画面（例如主页）。\n"
+        "2. 在「模板」页按「测试识别」。\n"
+        "3. 结果会写在「运行」页的日志：每个模板一行，后面的数字是相似度。\n\n"
+        "◆ 有打 ✓、数字 0.85 以上：认得出来。\n"
+        "◆ 0.75～0.85（黄色）：差一点，可以重截，或在「设置」把「识别严格度」调低一点。\n"
+        "◆ 0.75 以下：这个画面上本来就没有那个按钮是正常的；有的话就要重截。\n"
+        "◆ 在主页测试时，还会顺便读出彩色萝卜数量，读得到就代表 flow_jewel 也没问题。\n\n"
+        "有用加速器自动启动的话，「自动启动游戏」那一组的 uu_ 模板截法一样，"
+        "只是截的是整个桌面。"), 2),
+    ("第 3 步：定时设定", (
+        "在「运行」页的「定时」区：\n\n"
+        "◆ 每隔多少分钟重开：自主训练一轮大约 50 分钟，用默认的 50 就好。\n"
+        "◆ 启动后马上执行一次：打开的话，按启动就先做一轮。\n"
+        "◆ 还在自主训练中就等它结束：建议打开，时间到了还没跑完会等它。\n"
+        "◆ TP 不足时自动喝体力饮料；饮料用完要不要用宝石，可以自己选。"), 0),
+    ("第 4 步：粉丝目标（可选）", (
+        "同样在「运行」页：\n\n"
+        "◆ 打开「粉丝达到目标就停止」，选「今天累计」或「这次启动后」，填目标（单位：万）。\n"
+        "◆ 达标后会把那一轮奖励领完，然后停止，不再开新育成。\n"
+        "◆ 下面还可以选「达标后关闭游戏」「达标后关机」（关机前会倒数 60 秒，可以取消）。"), 0),
+    ("第 5 步：自动启动游戏（可选）", (
+        "到「设置」页的「自动启动游戏」：\n\n"
+        "◆ 打开「每轮结束后关闭游戏，下一轮前自动启动游戏」，游戏就不用一直挂着\n"
+        "◆ 「加速器位置」选你的加速器程序；「DMM 游戏快捷方式」选赛马娘的快捷方式。\n"
+        "◆ 第一次会从加速器加速再启动，之后都直接用 DMM 快捷方式打开。\n"
+        "◆ 不用加速器的话，打开「不开加速器，每次都直接用 DMM 快捷方式」。\n"
+        "◆ 设好后可以按「测试：关闭并自动启动一次」试试看。"), 3),
+    ("第 6 步：彩色萝卜与收益", (
+        "◆ 在「运行」页右上的「现在的萝卜」填一次你现在的彩色萝卜数量，按「记录」。"
+        "之后每轮结束会自动更新，每天凌晨 4 点重新计算。\n"
+        "◆ 「育成收益」页可以看每天拿了多少粉丝和萝卜、最近 14 天的图表，还能导出表格。"), 1),
+    ("第 7 步：开始挂机", (
+        "◆ 按上方的「▶ 启动」（或快捷键 F9）开始，「■ 停止」（或 F10）停止。"
+        "快捷键可以在「设置」页改。\n"
+        "◆ 紧急情况：把鼠标甩到屏幕左上角，会马上停止。\n"
+        "◆ 启动后软件会自己缩到任务栏，倒数等待时可以正常用电脑；"
+        "要点游戏的那几分钟，请让游戏留在画面上。\n"
+        "◆ 下面的「运行日志」会写出每一步做了什么。"), 0),
+    ("遇到问题时", (
+        "◆ 看「运行日志」：黄色是警告、红色是错误，通常会写原因。\n"
+        "◆ 「日志存档」按钮可以打开以前每天的记录。\n"
+        "◆ 程序出错时会把游戏画面存到 debug 文件夹，反馈时一起附上。\n"
+        "◆ 「设置」页可以「检查更新」，新版本会自动下载、保留你的设置和记录。\n"
+        "◆ Bug 反馈邮箱在「打赏」页。\n\n"
+        "这个教程随时可以从上方的「新手教程」再打开。祝你粉丝多多 ☺"), 4),
+]
+
+
 # ================= 主界面 =================
 class App:
     def __init__(self, root):
@@ -3061,6 +3182,8 @@ class App:
         self.load_today_log()
         self.log(f"{APP_NAME} v{VERSION} 已就绪")
         root.after(900, self.maybe_show_whats_new)
+        if not self.cfg_existed:   # 第一次打开：自动显示新手教程
+            root.after(1200, self.show_tutorial)
         if self.cfg.get("auto_update", True):
             root.after(2500, lambda: self.check_update(manual=False))
 
@@ -3083,6 +3206,7 @@ class App:
         hdr.pack(fill=X, side=TOP)
         tb.Label(hdr, text=APP_NAME, font=(FONT, 17, "bold"), bootstyle="inverse-primary").pack(side=LEFT)
         tb.Label(hdr, text=f"v{VERSION}", font=(FONT, 9), bootstyle="inverse-primary").pack(side=LEFT, padx=(8, 0), pady=(8, 0))
+        tb.Button(hdr, text="？ 新手教程", bootstyle="warning", command=self.show_tutorial).pack(side=LEFT, padx=(16, 0))
 
         self.btn_stop = tb.Button(hdr, text="■  停止", bootstyle="danger", width=9, command=self.stop, state=DISABLED)
         self.btn_stop.pack(side=RIGHT)
@@ -4444,6 +4568,105 @@ class App:
             self.root.deiconify()
         except Exception:
             pass
+        win.lift()
+        win.focus_force()
+
+    # ---------- 新手教程 ----------
+    def show_tutorial(self):
+        if getattr(self, "tut_win", None) and self.tut_win.winfo_exists():
+            self.tut_win.lift()
+            return
+        s = self.ui_scale()
+        win = tb.Toplevel(self.root)
+        self.tut_win = win
+        win.title(f"{APP_NAME}  新手教程")
+        win.transient(self.root)
+        win.resizable(False, False)
+        head = tb.Frame(win, bootstyle="primary", padding=(20, 12))
+        head.pack(fill=X)
+        lbl_step = tb.Label(head, text="", font=(FONT, 9), bootstyle="inverse-primary")
+        lbl_step.pack(anchor=W)
+        lbl_title = tb.Label(head, text="", font=(FONT, 15, "bold"), bootstyle="inverse-primary")
+        lbl_title.pack(anchor=W)
+        tb.Frame(win, height=3, bootstyle="warning").pack(fill=X)
+        body = tb.Frame(win, padding=(22, 16, 22, 8))
+        body.pack(fill=BOTH, expand=True)
+        # 用 Text 显示内容：中文可以在任何字之间换行，「◆」开头的项目换行后会对齐
+        txt = tk.Text(body, wrap="char", relief="flat", bd=0, highlightthickness=0, cursor="arrow",
+                      bg=PALETTE["bg"], fg=PALETTE["fg"], font=(FONT, 10), width=50, height=21,
+                      spacing1=2, spacing3=4)
+        txt.pack(fill=BOTH, expand=True)
+        txt.tag_configure("item", lmargin1=0, lmargin2=int(20 * s))
+        txt.tag_configure("dot", foreground=GOLD)
+        txt.tag_configure("key", font=(FONT, 10, "bold"), foreground=PALETTE["primary"])
+        dots = tb.Frame(win, padding=(22, 4))
+        dots.pack(fill=X)
+        dot_lbls = []
+        for _ in TUTORIAL:
+            d = tb.Label(dots, text="●", font=(FONT, 9))
+            d.pack(side=LEFT, padx=2)
+            dot_lbls.append(d)
+        foot = tb.Frame(win, padding=(22, 8, 22, 16))
+        foot.pack(fill=X)
+        btn_skip = tb.Button(foot, text="跳过教程", bootstyle="secondary-link", command=win.destroy)
+        btn_skip.pack(side=LEFT)
+        btn_next = tb.Button(foot, text="下一步", bootstyle="success", width=10)
+        btn_next.pack(side=RIGHT)
+        btn_prev = tb.Button(foot, text="上一步", bootstyle="secondary-outline", width=8)
+        btn_prev.pack(side=RIGHT, padx=(0, 8))
+        state = {"i": 0}
+
+        def show(i):
+            state["i"] = i
+            title, text, tab = TUTORIAL[i]
+            lbl_step.configure(text=f"新手教程　{i + 1} / {len(TUTORIAL)}")
+            lbl_title.configure(text=title)
+            txt.configure(state=NORMAL)
+            txt.delete("1.0", "end")
+            for ln in text.split("\n"):
+                if ln.startswith("◆"):
+                    body_ = ln[1:].rstrip("。")
+                    txt.insert("end", "◆", ("item", "dot"))
+                    head_, sep_, rest_ = body_.partition("：")
+                    if sep_ and len(head_) <= 40 and re.fullmatch(r"[ \w/（）()]+", head_):
+                        txt.insert("end", head_ + sep_, ("item", "key"))   # 模板名粗体
+                        txt.insert("end", rest_ + "\n", "item")
+                    else:
+                        txt.insert("end", body_ + "\n", "item")
+                elif ln[:2] in ("1.", "2.", "3.", "4."):
+                    txt.insert("end", ln + "\n", "item")
+                else:
+                    txt.insert("end", ln + "\n")
+            txt.configure(state=DISABLED)
+            for k, d in enumerate(dot_lbls):
+                d.configure(foreground=PALETTE["primary"] if k == i else PALETTE["border"])
+            btn_prev.configure(state=NORMAL if i > 0 else DISABLED)
+            btn_next.configure(text="完成 ✓" if i == len(TUTORIAL) - 1 else "下一步")
+            if tab is not None:
+                try:
+                    self.nb.select(tab)
+                except Exception:
+                    pass
+
+        def nxt():
+            if state["i"] >= len(TUTORIAL) - 1:
+                win.destroy()
+            else:
+                show(state["i"] + 1)
+
+        btn_next.configure(command=nxt)
+        btn_prev.configure(command=lambda: show(max(0, state["i"] - 1)))
+        win.bind("<Right>", lambda e: nxt())
+        win.bind("<Left>", lambda e: show(max(0, state["i"] - 1)))
+        win.bind("<Escape>", lambda e: win.destroy())
+        show(0)
+        win.update_idletasks()
+        w, h = max(win.winfo_reqwidth(), int(520 * s)), max(win.winfo_reqheight(), int(400 * s))
+        win.geometry(f"{w}x{h}")
+        rx, ry, rw = self.root.winfo_rootx(), self.root.winfo_rooty(), self.root.winfo_width()
+        sw = self.root.winfo_screenwidth()
+        x = rx + rw + 12 if rx + rw + 12 + w <= sw else rx + (rw - w) // 2   # 放在主窗口右边，放不下就放中间
+        win.geometry(f"+{max(0, x)}+{max(0, ry + 40)}")
         win.lift()
         win.focus_force()
 
