@@ -78,10 +78,14 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.25"
+VERSION = "3.26"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.26", "2026-10-20", [
+        "新增：前台自动育成可以指定用第几个育成计划：「运行」页「前台自动：用第几个育成计划」，"
+        "按「自动」后会先在「自动育成」视窗选好那个计划，再按「开始」；选「不指定」就用游戏里现在选的",
+    ]),
     ("3.25", "2026-10-20", [
         "调整：前台自动育成按下游戏的「自动」后，先等 30 分钟才开始看画面，这段时间不会动游戏",
         "修正：游戏被缩到任务栏时程序出错停止（ScreenShotError -32000）的问题：会先把游戏还原再截图",
@@ -336,6 +340,7 @@ DEFAULT_CFG = {
     "cycle_run_now": False,
     "wait_training": True,
     "front_wait_min": 30,      # 前台自动育成：按下游戏的「自动」后，先等几分钟才开始看画面     # 时间到时游戏里还在「自主训练中」，就等它结束再重开
+    "front_plan": 0,           # 前台自动育成：「自动育成」视窗里用第几个计划（由上往下数）；0＝不指定，用游戏里现在选的
     "run_as_admin": False,     # 以管理员身份运行（UU 加速器是管理员权限时，模拟的鼠标才会被它接收）
     "hotkey_start": "F9",      # 按这个键开始运行（「无」＝不用）
     "hotkey_stop": "F10",      # 按这个键停止；和启动键设成同一个，就是按一下启动、再按一下停止
@@ -1873,6 +1878,44 @@ class Bot(threading.Thread):
             return "auto", pos
         return None, "unknown"
 
+    def plan_radios(self, img, title, go):
+        """「自动育成」视窗左边那排圆形选项（每个计划一个）。
+        title＝视窗标题「自动育成」的位置，go＝「开 始」的位置，用两者的距离换算视窗大小。
+        回传 [(中心点, 是否选中)]，由上到下排列。"""
+        D = go[1] - title[1]
+        if D <= 0:
+            return []
+        x0, x1 = max(0, int(title[0] - 0.305 * D)), int(title[0] - 0.232 * D)
+        y0, y1 = max(0, int(title[1] + 0.06 * D)), int(go[1] - 0.06 * D)
+        reg = img[y0:y1, x0:x1]
+        if reg.size == 0:
+            return []
+        hsv = cv2.cvtColor(reg, cv2.COLOR_BGR2HSV)
+        gray = (hsv[..., 1] < 40) & (hsv[..., 2] > 120) & (hsv[..., 2] < 225)   # 没选中的灰色圆钮
+        green = ((hsv[..., 0] >= 30) & (hsv[..., 0] <= 85) & (hsv[..., 1] > 90)
+                 & (hsv[..., 2] > 90))                                           # 选中的绿色圆点
+        mask = gray | green
+        r_exp = 0.022 * D          # 圆钮半径大约是视窗高度的 2.2%
+        on = mask.sum(axis=1) > max(2, 0.3 * r_exp)
+        out, y, n = [], 0, len(on)
+        while y < n:
+            if not on[y]:
+                y += 1
+                continue
+            s = y
+            while y < n and on[y]:
+                y += 1
+            if not 1.3 * r_exp <= y - s <= 3.2 * r_exp:
+                continue
+            xs = np.where(mask[s:y].any(axis=0))[0]
+            if not 1.3 * r_exp <= xs.max() - xs.min() <= 3.2 * r_exp:
+                continue
+            cx, cy = int((xs.min() + xs.max()) / 2), (s + y) // 2
+            rr = max(2, int(0.45 * r_exp))
+            core = green[max(0, cy - rr):cy + rr, max(0, cx - rr):cx + rr]
+            out.append(((x0 + cx, y0 + cy), bool(core.size and core.mean() > 0.35)))
+        return out
+
     def fa_tap(self, img, label="画面（继续）"):
         """剧情、继承画面要点一下才会往下走：点游戏画面左边空白处（不会点到视窗里的按钮）。"""
         h, w = img.shape[:2]
@@ -1929,6 +1972,9 @@ class Bot(threading.Thread):
         idle_logged = 0.0
         banned = {}
         last_key, same_cnt = None, 0
+        want_plan = int(self.cfg.get("front_plan", 0) or 0)   # 0＝不指定计划
+        plan_done = not want_plan
+        plan_clicks = plan_miss = 0
         user_keys = [k for k in sorted(self.tpls) if k.startswith("btn_")]
         try:
             while not self.stop_evt.is_set():
@@ -2027,6 +2073,39 @@ class Bot(threading.Thread):
                         continue
                 else:
                     tp_wait = 0.0
+                # 「自动育成」视窗：按「开 始」前先选好指定的育成计划
+                if not plan_done and not acted:
+                    go = F("fa_auto_go")
+                    ttl = go and "fa_autodlg" in self.tpls and self.find(img, "fa_autodlg", 0.8)
+                    if go and "fa_autodlg" not in self.tpls:
+                        self.log("没有 fa_autodlg 模板，选不了育成计划，用游戏里现在选的", "warn")
+                        plan_done = True
+                    elif go and not ttl:
+                        plan_miss += 1    # 看到「开 始」却认不出视窗标题：多看几次，还是不行就不选了
+                        if plan_miss >= 6:
+                            self.log("认不出「自动育成」视窗标题（fa_autodlg），选不了育成计划，用游戏里现在选的", "warn")
+                            plan_done = True
+                        else:
+                            self.wait(0.5)
+                            continue
+                    elif ttl:
+                        radios = self.plan_radios(img, ttl, go)
+                        if len(radios) < want_plan:
+                            self.log(f"「自动育成」视窗里只认出 {len(radios)} 个计划，找不到第 {want_plan} 个，"
+                                     f"用游戏里现在选的", "warn")
+                            plan_done = True
+                        elif radios[want_plan - 1][1]:
+                            self.log(f"已选第 {want_plan} 个育成计划", "ok")
+                            plan_done = True
+                        elif plan_clicks >= 4:
+                            self.log(f"点了 {plan_clicks} 次还是没选上第 {want_plan} 个计划，用游戏里现在选的", "warn")
+                            plan_done = True
+                        else:
+                            plan_clicks += 1
+                            self.click(radios[want_plan - 1][0], f"第 {want_plan} 个育成计划")
+                            last_act = time.time()
+                            self.wait(0.4)
+                            continue
                 if no_drink and not acted and self.cfg.get("tp_use_jewel") and "flow_tp_jewel" in self.tpls:
                     pt = self.find_row_use(img, "flow_tp_jewel") if self.find(img, "flow_tp_jewel", 0.9) else None
                     if pt:
@@ -2077,6 +2156,8 @@ class Bot(threading.Thread):
                         continue          # 最终确认不是「常规养成」：不按开始
                     if key == "flow_auto_start":
                         continue          # 前台育成绝不按「自主训练养成开始！」
+                    if key == "fa_auto_go" and not plan_done:
+                        continue          # 还没选好育成计划，先不按「开 始」
                     if key == "fa_short_ok" and time.time() - short_clicked > 20 and F("fa_short_all"):
                         continue          # 先选「缩短所有事件」再按决定
                     if key == "fa_short_all" and (time.time() - short_clicked < 20 or not F("fa_short_ok")):
@@ -3443,6 +3524,7 @@ TUTORIAL = [
         "◆ 每隔多少分钟重开：自主训练一轮大约 50 分钟，用默认的 50 就好。\n"
         "◆ 启动后马上执行一次：打开的话，按启动就先做一轮。\n"
         "◆ 还在自主训练中就等它结束：建议打开，时间到了还没跑完会等它。\n"
+        "◆ 前台自动：用第几个育成计划：「自动育成」视窗里由上往下数第几个；「不指定」就用游戏里现在选的。\n"
         "◆ TP 不足时自动喝体力饮料；饮料用完要不要用宝石，可以自己选。"), 0),
     ("第 4 步：粉丝目标（可选）", (
         "同样在「运行」页：\n\n"
@@ -3494,6 +3576,9 @@ class App:
         self.v_cycle_now = tk.BooleanVar(value=self.cfg["cycle_run_now"])
         self.v_wait_training = tk.BooleanVar(value=self.cfg.get("wait_training", True))
         self.v_front_wait = tk.IntVar(value=self.cfg.get("front_wait_min", 30))
+        self.plan_choices = ["不指定"] + [f"第 {i} 个" for i in range(1, 9)]
+        fp = int(self.cfg.get("front_plan", 0) or 0)
+        self.v_front_plan = tk.StringVar(value=self.plan_choices[fp if 0 <= fp < len(self.plan_choices) else 0])
         self.v_admin = tk.BooleanVar(value=self.cfg.get("run_as_admin", False))
         self.v_key_start = tk.StringVar(value=self.cfg.get("hotkey_start", "F9"))
         self.v_key_stop = tk.StringVar(value=self.cfg.get("hotkey_stop", "F10"))
@@ -3666,6 +3751,9 @@ class App:
                        bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
         self.row(self.box_cycle, "前台自动：按「自动」后先等几分钟",
                  lambda p: tb.Spinbox(p, from_=0, to=120, textvariable=self.v_front_wait, width=7))
+        self.row(self.box_cycle, "前台自动：用第几个育成计划",
+                 lambda p: tb.Combobox(p, textvariable=self.v_front_plan, values=self.plan_choices,
+                                       state="readonly", width=7))
         tb.Checkbutton(self.box_cycle, text="TP 不足时自动喝体力饮料", variable=self.v_tp_drink,
                        bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
         tb.Checkbutton(self.box_cycle, text="饮料用完时用宝石回复（会消耗宝石）", variable=self.v_tp_jewel,
@@ -4410,6 +4498,8 @@ class App:
                 cycle_run_now=bool(self.v_cycle_now.get()),
                 wait_training=bool(self.v_wait_training.get()),
                 front_wait_min=int(self.v_front_wait.get()),
+                front_plan=(self.plan_choices.index(self.v_front_plan.get())
+                            if self.v_front_plan.get() in self.plan_choices else 0),
                 run_as_admin=bool(self.v_admin.get()),
                 hotkey_start=self.v_key_start.get() or "无",
                 hotkey_stop=self.v_key_stop.get() or "无",
