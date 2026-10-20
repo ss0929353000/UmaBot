@@ -78,10 +78,14 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.21"
+VERSION = "3.22"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.22", "2026-10-20", [
+        "新增：「前台自动育成」模式：自动开一轮常规养成、缩短所有事件、按游戏的「自动」跑完（约 30 多分钟），"
+        "结束后领奖、记录粉丝，再开下一轮；粉丝目标、体力饮料设置照样有效",
+    ]),
     ("3.21", "2026-10-16", [
         "新手教程：截模板的部分改成 6 页，一步一步教怎么截、每个按钮在哪个画面、怎么检查有没有截好",
     ]),
@@ -209,14 +213,17 @@ os.makedirs(TPL_DIR, exist_ok=True)
 
 MODES = {
     "auto_cycle": "⏱  定时重开自动育成",
+    "front_auto": "▶  前台自动育成",
     "story": "☰  剧情跳过领奖励",
 }
 MODE_HINT = {
     "auto_cycle": "先在游戏里开好自动育成，再点启动",
+    "front_auto": "游戏停在主页再点启动；一轮约 30 多分钟，跑完会自动开下一轮",
     "story": "先让游戏停在剧情列表，再点启动",
 }
 REQUIRED = {
     "auto_cycle": ["flow_home", "flow_next", "flow_ikusei_start", "flow_auto_start"],
+    "front_auto": ["flow_home", "flow_next", "flow_ikusei_start", "fa_start", "fa_auto", "fa_auto_go"],
     "story": ["story_list", "story_new", "story_skip"],
 }
 TEMPLATE_GROUPS = [
@@ -250,6 +257,18 @@ TEMPLATE_GROUPS = [
         "err_3d": "错误弹窗里的「3D资源读取失败。」文字（看到就关游戏重开）",
         "end_next": "领奖画面的「下项」（左半边，避开闪光圈）",
         "end_next_b": "结算画面的「下项」（左半边，避开闪光圈）",
+    }),
+    ("前台自动育成（常规养成＋游戏的「自动」）", "fa_", {
+        "fa_start": "最终确认（常规养成）底部的「育成开始！」，只框「育成开」三个字",
+        "fa_final": "最终确认视窗标题「最终确认」（用来找「常规养成」分页的位置）",
+        "fa_skip": "开场动画右下角的跳过按钮（⏭）",
+        "fa_short_all": "事件缩短设定里「缩短所有事件」这几个字",
+        "fa_short_ok": "事件缩短设定的「决 定」",
+        "fa_plan_ok": "安排表调用确认的「决 定」",
+        "fa_auto": "育成画面右边橘色的「自 动」按钮",
+        "fa_autodlg": "自动育成视窗标题「自动育成」",
+        "fa_auto_go": "自动育成视窗的「开 始」",
+        "fa_running": "画面下方的「おまかせ中」（自动育成进行中）",
     }),
     ("自动启动游戏（加速器）", "uu_", {
         "uu_tile": "（UU 专用）首页里「赛马娘Pretty Derby」这几个字",
@@ -1267,6 +1286,8 @@ class Bot(threading.Thread):
         btn_keys = sorted(k for k in self.tpls if k.startswith("btn_"))
         if mode == "auto_cycle":
             self.cycle_loop()
+        elif mode == "front_auto":
+            self.front_loop()
         elif custom:
             self.custom_loop(mode)
         else:
@@ -1398,7 +1419,7 @@ class Bot(threading.Thread):
                   "__drink", "__jewel", "__running", "flow_tp_recover", "flow_home", "flow_home_running"}
 
     # 领奖画面的「下项」右边常盖着一个闪光圈，用只框左半边的模板、门槛放宽
-    STEP_THR = {"end_next": 0.78, "end_next_b": 0.78, "end_finish": 0.9}
+    STEP_THR = {"end_next": 0.78, "end_next_b": 0.78, "end_finish": 0.9, "flow_close": 0.8}
     # 只有前一步点过之后才可能出现的按钮：没育成时不会去点「结束」
     NEEDS = {"end_finish": "end_finish_btn", "end_factor_ok": "end_finish", "end_confirm": "end_factor_ok"}
 
@@ -1774,6 +1795,228 @@ class Bot(threading.Thread):
             self.wait(60)
         self.state_text = None
         return False
+
+    # ---- 前台自动育成：开一轮「常规养成」，交给游戏自己的「自动」跑完，结束后领奖再开下一轮 ----
+    FA_THR = {"fa_start": 0.85, "fa_auto_go": 0.88, "fa_short_all": 0.88, "fa_short_ok": 0.82,
+              "fa_plan_ok": 0.82, "fa_auto": 0.82, "fa_running": 0.8, "fa_skip": 0.8, "fa_final": 0.85,
+              "end_next": 0.78, "end_next_b": 0.78, "end_finish": 0.9, "flow_close": 0.8}
+
+    def fa_tap(self, img, label="画面（继续）"):
+        """剧情、继承画面要点一下才会往下走：点游戏画面左边空白处（不会点到视窗里的按钮）。"""
+        h, w = img.shape[:2]
+        self.click((int(w * 0.10), int(h * 0.45)), label)
+
+    def front_loop(self):
+        careers = 0
+        while not self.stop_evt.is_set():
+            goal = self.fan_goal()
+            if goal and self.fans_so_far() >= goal:
+                scope = "这次启动后" if self.cfg.get("fan_goal_scope") == "run" else "今天"
+                self.log(f"{scope}粉丝已经达到目标 {fmt_fans(goal)}，不再开始新育成，已停止", "ok")
+                self.state_text = "粉丝已达标，已停止"
+                self.goal_finish()
+                self.stop_evt.set()
+                return
+            careers += 1
+            self.log(f"前台自动育成：第 {careers} 轮")
+            r = self.front_career()
+            if self.goal_hit and not self.stop_evt.is_set():
+                self.log(f"{self.goal_hit}，这轮的奖励已领完，不再开始新育成，已停止", "ok")
+                self.state_text = "粉丝已达标，已停止"
+                self.goal_finish()
+                self.stop_evt.set()
+                return
+            if r == "tp":
+                self.log(f"体力不够（{self.tp_out}），已停止", "err")
+                self.state_text = "体力用完，已停止"
+                self.stop_evt.set()
+                return
+            if r is False and not self.stop_evt.is_set():
+                self.save_debug_shot()
+                self.log("这一轮卡住了，30 秒后从目前的画面接着试", "warn")
+                self.wait(30)
+
+    def front_career(self):
+        """一轮：主页 → 育成 → 常规养成 → 缩短事件 → 点「自动」→ 等它跑完 → 结束育成、领奖 → 回到「再次育成」/主页。"""
+        self.tp_out = None
+        self.state_text = None
+        t_start = time.time()
+        started = False        # 已经按下「育成开始！」
+        auto_on = False        # 游戏的「自动」已经开始
+        finished = False       # 已经进到结束流程
+        short_clicked = 0.0
+        fans_done = False
+        gain = None
+        drinks = 0
+        no_drink = False
+        last_act = time.time()
+        last_tap = 0.0
+        run_logged = False
+        idle_logged = 0.0
+        banned = {}
+        last_key, same_cnt = None, 0
+        user_keys = [k for k in sorted(self.tpls) if k.startswith("btn_")]
+        try:
+            while not self.stop_evt.is_set():
+                if time.time() - t_start > 120 * 60:
+                    self.log("这一轮已经超过 2 小时还没结束，可能卡住了", "warn")
+                    return False
+                img = self.capture()
+                if img is None:
+                    self.log("游戏窗口不见了", "err")
+                    return False
+                br = self.broken_reason(img)
+                if br:
+                    if self.recoveries >= 10 or not self.recover_game(br):
+                        return False
+                    continue
+
+                def F(k):
+                    if k not in self.tpls or banned.get(k, 0) > time.time():
+                        return None
+                    return self.find(img, k, self.FA_THR.get(k))
+
+                # 游戏的自动育成进行中：不动它，慢慢等
+                if F("fa_running"):
+                    auto_on = started = True
+                    if not run_logged:
+                        self.log("游戏的自动育成进行中，等它跑完（一轮约 30 多分钟）", "ok")
+                        run_logged = True
+                    mins = int((time.time() - t_start) // 60)
+                    self.state_text = f"前台自动育成中…（这轮已 {mins} 分钟）"
+                    last_act = time.time()
+                    self.wait(15)
+                    continue
+                self.state_text = None
+
+                # 获得奖励：记录粉丝
+                if not fans_done and "end_fans" in self.tpls and self.find(img, "end_fans"):
+                    fans_done = finished = True
+                    gain = self.read_fans()
+                    if gain is not None:
+                        self.log(f"这轮育成获得粉丝 +{gain:,}", "ok")
+                        self.check_fan_goal(gain)
+                    else:
+                        self.log("没读到这轮的粉丝数，可以到「育成收益」页手动补记", "warn")
+                    if self.fans:
+                        self.fans.add(gain, None)
+                    continue
+
+                # 结束流程走完、回到可以开新一轮的画面：这一轮完成
+                if finished and (F("end_again") or F("flow_home")):
+                    self.log("这一轮完成", "ok")
+                    return True
+
+                acted = None
+                # 最终确认停在「自主训练养成」分页：切到「常规养成」
+                if F("flow_auto_start"):
+                    fin = F("fa_final")
+                    if fin:
+                        h = img.shape[0]
+                        self.click((int(fin[0] - 0.141 * h), int(fin[1] + 0.119 * h)), "「常规养成」分页")
+                        acted = "tab"
+                    else:
+                        self.log("最终确认现在是「自主训练养成」，认不出「最终确认」标题，没办法切到「常规养成」。"
+                                 "请到「模板」页截取 fa_final", "err")
+                        return False
+                steps = [
+                    ("fa_auto_go", "自动育成：开始"),
+                    ("fa_short_all", "缩短所有事件"),
+                    ("fa_short_ok", "决定"),
+                    ("fa_plan_ok", "决定"),
+                    ("fa_start", "育成开始！（常规养成）"),
+                    ("end_confirm", "确定"), ("end_factor_ok", "确定因子"), ("end_finish", "结束育成"),
+                    ("end_finish_btn", "育成完成！"),
+                    ("end_next", "下项"), ("end_next_b", "下项"), ("end_close", "关闭"),
+                    ("flow_ok", "OK"), ("__drink", ""), ("flow_tp_recover", "回复 TP"),
+                    ("flow_close", "关闭"), ("flow_decide", "决定"),
+                    ("fa_auto", "自动"),
+                    ("fa_skip", "跳过"),
+                    ("flow_ikusei_start", "育成开始！"), ("flow_next", "下项"),
+                    ("end_again", "再次育成"), ("end_go", "前往育成"),
+                    ("flow_home", "育成"),
+                ] + [(k, k) for k in user_keys]
+                for key, label in ([] if acted else steps):
+                    if key == "__drink":
+                        pt = None if no_drink else self.find_drink_use(img)
+                        if pt:
+                            if not self.cfg.get("tp_auto_drink", True):
+                                self.tp_out = "TP 不足，而且没开「自动喝体力饮料」"
+                                return "tp"
+                            if drinks >= DRINK_SAFETY_CAP:
+                                self.tp_out = f"这轮已经喝了 {drinks} 瓶 TP 还是不够"
+                                return "tp"
+                            drinks += 1
+                            self.run_drinks += 1
+                            if not self.click(pt, f"使用体力饮料（这次启动后共 {self.run_drinks} 瓶）"):
+                                no_drink = True
+                                self.run_drinks -= 1
+                            acted = key
+                            break
+                        continue
+                    if key == "fa_short_ok" and time.time() - short_clicked > 20 and F("fa_short_all"):
+                        continue          # 先选「缩短所有事件」再按决定
+                    if key == "fa_short_all" and (time.time() - short_clicked < 20 or not F("fa_short_ok")):
+                        continue          # 只在「事件缩短设定」视窗里（有「决 定」）才点
+                    if key == "end_finish" and "end_finish_btn" in self.tpls and not finished:
+                        continue          # 没看到「育成完成！」之前不点「结束」
+                    if key in ("end_again", "end_go", "flow_home") and finished:
+                        continue
+                    if key == "flow_home" and started and not finished:
+                        continue          # 育成途中回到主页（例如中断后）：点「育成」会接着上次的育成
+                    if key == "fa_auto" and auto_on and time.time() - last_act < 60:
+                        continue
+                    if key == "flow_tp_recover" and not self.cfg.get("tp_auto_drink", True):
+                        if F(key):
+                            self.tp_out = "TP 不足，而且没开「自动喝体力饮料」"
+                            return "tp"
+                        continue
+                    pt = F(key)
+                    if not pt:
+                        continue
+                    changed = self.click(pt, label)
+                    if key == last_key and not changed:
+                        same_cnt += 1
+                    else:
+                        same_cnt = 0 if changed else 1
+                    last_key = key
+                    if same_cnt >= 3:
+                        banned[key] = time.time() + 60
+                        same_cnt = 0
+                        self.log(f"「{label}」连点 3 次画面都没反应，先跳过它", "warn")
+                    if key == "fa_short_all":
+                        short_clicked = time.time()
+                    if key == "fa_start":
+                        started = True
+                        self.log("已开始常规养成", "ok")
+                    if key == "fa_auto_go":
+                        auto_on = True
+                    if key == "end_finish_btn":
+                        finished = True
+                    acted = key
+                    break
+                if acted:
+                    last_act = time.time()
+                    continue
+                idle = time.time() - last_act
+                # 开场剧情、继承、目标画面：点一下继续（游戏的自动开始后就不乱点）
+                if (started and not auto_on or finished) and idle > 2.5 and time.time() - last_tap > 2:
+                    last_tap = time.time()
+                    self.fa_tap(img)
+                    continue
+                if auto_on and not finished and idle > 90 and time.time() - last_tap > 10:
+                    last_tap = time.time()   # 自动育成停下来、认不出画面：点一下看看
+                    self.fa_tap(img)
+                    continue
+                if idle > 30 and time.time() - idle_logged > 60:
+                    idle_logged = time.time()
+                    scores = sorted(((match(img, t, 0.99)[1], k) for k, t in self.tpls.items()), reverse=True)[:3]
+                    self.log("约 30 秒认不出可点的按钮。最接近的："
+                             + "、".join(f"{k} {v:.2f}" for v, k in scores), "warn")
+                self.wait(0.6)
+            return False
+        finally:
+            self.state_text = None
 
     SHUTDOWN_DELAY = 60  # 关机前倒数几秒（这段时间可以按「取消关机」）
 
@@ -3953,7 +4196,7 @@ class App:
         for b in (self.box_cycle, self.box_story, self.box_custom):
             b.pack_forget()
         custom = mode in modes
-        if mode == "auto_cycle":
+        if mode in ("auto_cycle", "front_auto"):
             self.box_cycle.pack(fill=X)
         elif custom:
             m = modes[mode]
