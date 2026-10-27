@@ -4,7 +4,7 @@
 - 定时结束并重开游戏内置自动育成
 - 剧情跳过领奖励
 原理：截取游戏窗口 → OpenCV 模板比对 → 模拟鼠标点击。模板需在程序内自行截取。
-启动 / 停止快捷键可在「设置」页修改（默认 F9 / F10）；把鼠标移到屏幕左上角可紧急停止。
+启动 / 停止快捷键可在「设置」页修改（默认 F10：按一下启动、再按一下停止）；把鼠标移到屏幕左上角可紧急停止。
 """
 import base64
 import csv
@@ -78,10 +78,28 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.26"
+VERSION = "3.31"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.31", "2026-10-27", [
+        "调整：启动 / 停止的默认快捷键都改成 F10，按一下启动、再按一下停止（原本用默认 F9 / F10 的会自动换过来）",
+    ]),
+    ("3.30", "2026-10-27", [
+        "新增：「马娘/卡组」页加了「＋」卡片，可以存好几个马娘和支援卡组，点「＋」直接选要用哪一个",
+        "新增：截取马娘头像或支援卡组后，可以取个名字存起来；存过的可以改名、删除",
+    ]),
+    ("3.29", "2026-10-27", [
+        "调整：指定马娘 / 支援卡组改成独立的「马娘/卡组」页，可以直接在那页截取、看到截好的图",
+        "修正：「运行」页左边那栏太长时滑不下去，现在可以用滚轮或右边的滚动条往下滑",
+    ]),
+    ("3.28", "2026-10-27", [
+        "新增：指定育成马娘、指定支援卡组（「运行」页两个开关）。在「模板」页截好要用的马娘头像（sel_chara）"
+        "和那组 6 张卡（sel_deck），开始育成时会自动在列表里找到那匹马娘、把卡组翻到那一组",
+    ]),
+    ("3.27", "2026-10-21", [
+        "修正：最终确认切换分页后跳出「安排表调用确认」时会卡住不动的问题，现在会先按「决 定」",
+    ]),
     ("3.26", "2026-10-20", [
         "新增：前台自动育成可以指定用第几个育成计划：「运行」页「前台自动：用第几个育成计划」，"
         "按「自动」后会先在「自动育成」视窗选好那个计划，再按「开始」；选「不指定」就用游戏里现在选的",
@@ -273,6 +291,12 @@ TEMPLATE_GROUPS = [
         "end_next": "领奖画面的「下项」（左半边，避开闪光圈）",
         "end_next_b": "结算画面的「下项」（左半边，避开闪光圈）",
     }),
+    ("指定马娘 / 支援卡组（「运行」页打开开关才会用）", "sel_", {
+        "sel_chara_title": "选马娘画面左上角「选择育成赛马娘」这几个字",
+        "sel_chara": "要育成的那匹马娘在列表里的头像（只框脸，不要框星星和觉醒等级）",
+        "sel_deck": "要用的支援卡组：整组 6 张卡（框住 6 张卡，不要框到上面的卡组名称）",
+        "sel_copy": "支援卡组画面右上角的「复制」按钮（用来找换卡组的箭头）",
+    }),
     ("前台自动育成（常规养成＋游戏的「自动」）", "fa_", {
         "fa_start": "最终确认（常规养成）底部的「育成开始！」，只框「育成开」三个字",
         "fa_final": "最终确认视窗标题「最终确认」（用来找「常规养成」分页的位置）",
@@ -340,9 +364,11 @@ DEFAULT_CFG = {
     "cycle_run_now": False,
     "wait_training": True,
     "front_wait_min": 30,      # 前台自动育成：按下游戏的「自动」后，先等几分钟才开始看画面     # 时间到时游戏里还在「自主训练中」，就等它结束再重开
+    "pick_chara": False,       # 选马娘画面：选「模板」页截的那匹马娘（sel_chara）
+    "pick_deck": False,        # 支援卡组画面：翻到「模板」页截的那组卡（sel_deck）
     "front_plan": 0,           # 前台自动育成：「自动育成」视窗里用第几个计划（由上往下数）；0＝不指定，用游戏里现在选的
     "run_as_admin": False,     # 以管理员身份运行（UU 加速器是管理员权限时，模拟的鼠标才会被它接收）
-    "hotkey_start": "F9",      # 按这个键开始运行（「无」＝不用）
+    "hotkey_start": "F10",     # 按这个键开始运行（「无」＝不用）
     "hotkey_stop": "F10",      # 按这个键停止；和启动键设成同一个，就是按一下启动、再按一下停止
     "cycle_timeout": 600,
     "tp_auto_drink": True,
@@ -359,7 +385,7 @@ DEFAULT_CFG = {
     "story_new_region": None,
     "window_title": "umamusume",
     "delay": 0.3,
-    "cfg_version": 4,
+    "cfg_version": 5,
     "match_threshold": 0.85,
     "capture_size": None,
     "custom_templates": {},
@@ -443,6 +469,10 @@ def load_cfg():
     if cfg.get("cfg_version", 0) < 4:  # 旧版本的等待时间太长，升级时自动调快
         cfg["delay"] = min(cfg.get("delay", 0.3), 0.3)
         cfg["cfg_version"] = 4
+    if cfg.get("cfg_version", 0) < 5:  # 3.31：默认快捷键改成 F10 一个键启动 / 停止
+        if cfg.get("hotkey_start") == "F9" and cfg.get("hotkey_stop") == "F10":
+            cfg["hotkey_start"] = "F10"
+        cfg["cfg_version"] = 5
     if cfg.get("mode") not in MODES and cfg.get("mode") not in cfg.get("custom_modes", {}):
         cfg["mode"] = "auto_cycle"
     return cfg
@@ -525,7 +555,7 @@ def hotkey_id(label):
 
 
 def hotkey_hint(cfg):
-    a, b = cfg.get("hotkey_start", "F9"), cfg.get("hotkey_stop", "F10")
+    a, b = cfg.get("hotkey_start", "F10"), cfg.get("hotkey_stop", "F10")
     parts = []
     if a and a != "无" and a == b:
         parts.append(f"按 {a} 启动 / 停止")
@@ -844,6 +874,95 @@ def load_meta():
 def save_meta(meta):
     with open(META_PATH, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=1)
+
+
+# ---- 马娘 / 支援卡组库：可以存好几个，用的时候选一个复制成 sel_chara / sel_deck ----
+LIB_DIR = os.path.join(TPL_DIR, "library")
+LIB_META = os.path.join(LIB_DIR, "lib.json")
+LIB_KEY = {"chara": "sel_chara", "deck": "sel_deck"}
+
+
+def lib_meta():
+    try:
+        with open(LIB_META, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def lib_list(kind):
+    """回传 [(名称, 路径)]，按存进去的先后排列。"""
+    d = os.path.join(LIB_DIR, kind)
+    if not os.path.isdir(d):
+        return []
+    items = [(fn[:-4], os.path.join(d, fn)) for fn in os.listdir(d) if fn.lower().endswith(".png")]
+    return sorted(items, key=lambda it: os.path.getmtime(it[1]))
+
+
+def lib_clean_name(name):
+    return re.sub(r'[\\/:*?"<>|]', "_", name.strip())[:30]
+
+
+def lib_save(kind, name, src):
+    """把 templates 里现在的 sel_chara / sel_deck 存进库。"""
+    name = lib_clean_name(name)
+    if not name or not os.path.exists(src):
+        return None
+    d = os.path.join(LIB_DIR, kind)
+    os.makedirs(d, exist_ok=True)
+    dst = os.path.join(d, name + ".png")
+    with open(src, "rb") as a, open(dst, "wb") as b:
+        b.write(a.read())
+    m = lib_meta()
+    h = load_meta().get(LIB_KEY[kind])
+    if h:
+        m[f"{kind}/{name}"] = h
+        with open(LIB_META, "w", encoding="utf-8") as f:
+            json.dump(m, f, ensure_ascii=False, indent=1)
+    return dst
+
+
+def lib_use(kind, name):
+    """把库里的一个复制成正在用的模板。"""
+    src = os.path.join(LIB_DIR, kind, name + ".png")
+    key = LIB_KEY[kind]
+    with open(src, "rb") as a, open(tpl_path(key), "wb") as b:
+        b.write(a.read())
+    h = lib_meta().get(f"{kind}/{name}")
+    if h:
+        meta = load_meta()
+        meta[key] = h
+        save_meta(meta)
+
+
+def lib_delete(kind, name):
+    try:
+        os.remove(os.path.join(LIB_DIR, kind, name + ".png"))
+    except OSError:
+        pass
+    m = lib_meta()
+    if m.pop(f"{kind}/{name}", None) is not None:
+        with open(LIB_META, "w", encoding="utf-8") as f:
+            json.dump(m, f, ensure_ascii=False, indent=1)
+
+
+def file_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def lib_active(kind):
+    """库里哪一个跟正在用的模板一样（没有就回传 None）。"""
+    cur = file_bytes(tpl_path(LIB_KEY[kind]))
+    if cur is None:
+        return None
+    for name, path in lib_list(kind):
+        if file_bytes(path) == cur:
+            return name
+    return None
 
 
 WORK_H = 760  # 识别时把画面缩到这个高度以内，速度快很多
@@ -1562,6 +1681,7 @@ class Bot(threading.Thread):
         self.wait(0.5)
 
     def restart_auto(self):
+        self.reset_pick()
         self.clear_desktop()
         self.tp_out = None
         self.result = {"gain": None, "jewels_before": None, "jewels_after": None}
@@ -1687,13 +1807,18 @@ class Bot(threading.Thread):
                 if self.find(img, "end_again") or self.find(img, "flow_home") or self.find(img, "flow_home_running"):
                     return False
             # 最终确认：上面的分页要是「自主训练养成」（后台自动育成），是「常规养成」就切过去
+            if not self.goal_hit and self.handle_pick(img):
+                continue
+            # 切分页后会跳出「安排表调用确认」盖在最终确认上面：先按「决 定」
+            if "fa_plan_ok" in self.tpls:
+                pt = self.find(img, "fa_plan_ok", 0.85)
+                if pt:
+                    self.click(pt, "安排表调用确认：决定")
+                    continue
             tab, tab_pos = self.final_tab(img)
             if tab == "normal":
                 self.click(tab_pos["auto"], "「自主训练养成」分页")
                 self.wait(0.8)
-                continue
-            if tab is None and tab_pos == "unknown":
-                self.wait(0.5)
                 continue
             acted = False
             for key, label in self.STEPS + [(k, k) for k in user_keys]:
@@ -1848,6 +1973,83 @@ class Bot(threading.Thread):
               "fa_plan_ok": 0.82, "fa_auto": 0.82, "fa_running": 0.8, "fa_skip": 0.8, "fa_final": 0.85,
               "end_next": 0.78, "end_next_b": 0.78, "end_finish": 0.9, "flow_close": 0.8}
 
+    # ---- 指定马娘 / 支援卡组 ----
+    def reset_pick(self):
+        self.chara_ok = not self.cfg.get("pick_chara")
+        self.deck_ok = not self.cfg.get("pick_deck")
+        self.chara_tries = self.deck_tries = 0
+        self.chara_scroll_dir = -1
+
+    def chara_selected(self, img, pt):
+        """选中的马娘头像四角有绿色的框：看左上、右上两个角。"""
+        h = img.shape[0]
+        hits = 0
+        for dx in (-0.050, 0.050):
+            x, y = int(pt[0] + dx * h), int(pt[1] - 0.047 * h)
+            r = max(2, int(0.012 * h))
+            reg = img[max(0, y - r):y + r, max(0, x - r):x + r]
+            if reg.size == 0:
+                continue
+            hsv = cv2.cvtColor(reg, cv2.COLOR_BGR2HSV)
+            m = (hsv[..., 0] >= 35) & (hsv[..., 0] <= 80) & (hsv[..., 1] > 120) & (hsv[..., 2] > 120)
+            hits += m.mean() > 0.12
+        return hits >= 2
+
+    def handle_pick(self, img):
+        """在选马娘 / 选支援卡组画面，先选好指定的再让流程按「下项」「育成开始！」。回传 True＝这次有动作。"""
+        if not hasattr(self, "chara_ok"):
+            self.reset_pick()
+        h = img.shape[0]
+        if not self.chara_ok and {"sel_chara", "sel_chara_title"} <= set(self.tpls):
+            ttl = self.find(img, "sel_chara_title", 0.8)
+            if ttl:
+                pt = self.find(img, "sel_chara", 0.8)
+                if pt:
+                    if self.chara_selected(img, pt):
+                        self.log("已选好指定的育成马娘", "ok")
+                        self.chara_ok = True
+                        return False
+                    self.chara_tries += 1
+                    if self.chara_tries > 4:
+                        self.log("点了几次指定马娘都没选上，用现在选的", "warn")
+                        self.chara_ok = True
+                        return False
+                    self.click(pt, "指定的育成马娘")
+                    self.wait(0.6)
+                    return True
+                # 列表里没看到：用滚轮翻列表（先往下，再往上）
+                self.chara_tries += 1
+                if self.chara_tries > 24:
+                    self.log("列表里找不到指定的马娘（sel_chara），用现在选的", "warn")
+                    self.chara_ok = True
+                    return False
+                if self.chara_tries == 10:
+                    self.chara_scroll_dir = 1
+                x = self.rect[0] + int((ttl[0] + 0.299 * h) / self.f)
+                y = self.rect[1] + int((ttl[1] + 0.511 * h) / self.f)
+                real_move(x, y, 0.2)
+                pyautogui.scroll(self.chara_scroll_dir * 3, x, y)
+                self.wait(0.8)
+                return True
+        if not self.deck_ok and {"sel_deck", "sel_copy"} <= set(self.tpls):
+            cp = self.find(img, "sel_copy", 0.8)
+            if cp:
+                if self.find(img, "sel_deck", 0.78):
+                    if self.deck_tries:
+                        self.log("已换到指定的支援卡组", "ok")
+                    self.deck_ok = True
+                    return False
+                self.deck_tries += 1
+                if self.deck_tries > 25:
+                    self.log("翻了 25 次都没看到指定的支援卡组（sel_deck），用现在的卡组", "warn")
+                    self.deck_ok = True
+                    return False
+                # 卡组右边的「›」箭头：在「复制」按钮的右下方
+                self.click((int(cp[0] + 0.051 * h), int(cp[1] + 0.266 * h)), "下一个支援卡组")
+                self.wait(0.9)
+                return True
+        return False
+
     def final_tab(self, img):
         """最终确认视窗上方的两个分页，哪个是绿色（选中）。
         回传 (状态, 位置)：状态 "normal"＝常规养成（前台育成）、"auto"＝自主训练养成、None＝不在最终确认或看不出来；
@@ -1953,6 +2155,7 @@ class Bot(threading.Thread):
 
     def front_career(self):
         """一轮：主页 → 育成 → 常规养成 → 缩短事件 → 点「自动」→ 等它跑完 → 结束育成、领奖 → 回到「再次育成」/主页。"""
+        self.reset_pick()
         self.tp_out = None
         self.state_text = None
         t_start = time.time()
@@ -2036,13 +2239,18 @@ class Bot(threading.Thread):
 
                 acted = None
                 # 最终确认：先确认上面的分页是「常规养成」（前台育成），是「自主训练养成」就切过去
+                if not finished and self.handle_pick(img):
+                    last_act = time.time()
+                    continue
+                # 切分页后可能跳出「安排表调用确认」盖在最终确认上面：先按「决 定」
+                if F("fa_plan_ok"):
+                    self.click(F("fa_plan_ok"), "安排表调用确认：决定")
+                    last_act = time.time()
+                    continue
                 tab, tab_pos = self.final_tab(img)
                 if tab == "auto":
                     self.click(tab_pos["normal"], "「常规养成」分页（前台育成）")
                     self.wait(0.8)
-                    continue
-                if tab is None and tab_pos == "unknown":
-                    self.wait(0.5)    # 看得到「最终确认」但分辨不出分页：再看一次，不要先按开始
                     continue
                 # TP 不够：先处理回复（跟定时模式一样：回复 → 体力饮料「使用」→ OK → 关闭）
                 tp_list = "flow_tp_drink" in self.tpls and not no_drink and self.find(img, "flow_tp_drink", 0.85)
@@ -2152,7 +2360,7 @@ class Bot(threading.Thread):
                             acted = key
                             break
                         continue
-                    if key in ("fa_start", "flow_ikusei_start", "flow_auto_start") and tab is not None and tab != "normal":
+                    if key in ("fa_start", "flow_ikusei_start", "flow_auto_start") and tab_pos and tab != "normal":
                         continue          # 最终确认不是「常规养成」：不按开始
                     if key == "flow_auto_start":
                         continue          # 前台育成绝不按「自主训练养成开始！」
@@ -3543,7 +3751,7 @@ TUTORIAL = [
         "之后每轮结束会自动更新，每天凌晨 4 点重新计算。\n"
         "◆ 「育成收益」页可以看每天拿了多少粉丝和萝卜、最近 14 天的图表，还能导出表格。"), 1),
     ("第 7 步：开始挂机", (
-        "◆ 按上方的「▶ 启动」（或快捷键 F9）开始，「■ 停止」（或 F10）停止。"
+        "◆ 按上方的「▶ 启动」开始，「■ 停止」停止；也可以按快捷键 F10，按一下启动、再按一下停止。"
         "快捷键可以在「设置」页改。\n"
         "◆ 紧急情况：把鼠标甩到屏幕左上角，会马上停止。\n"
         "◆ 启动后软件会自己缩到任务栏，倒数等待时可以正常用电脑；"
@@ -3578,9 +3786,11 @@ class App:
         self.v_front_wait = tk.IntVar(value=self.cfg.get("front_wait_min", 30))
         self.plan_choices = ["不指定"] + [f"第 {i} 个" for i in range(1, 9)]
         fp = int(self.cfg.get("front_plan", 0) or 0)
+        self.v_pick_chara = tk.BooleanVar(value=self.cfg.get("pick_chara", False))
+        self.v_pick_deck = tk.BooleanVar(value=self.cfg.get("pick_deck", False))
         self.v_front_plan = tk.StringVar(value=self.plan_choices[fp if 0 <= fp < len(self.plan_choices) else 0])
         self.v_admin = tk.BooleanVar(value=self.cfg.get("run_as_admin", False))
-        self.v_key_start = tk.StringVar(value=self.cfg.get("hotkey_start", "F9"))
+        self.v_key_start = tk.StringVar(value=self.cfg.get("hotkey_start", "F10"))
         self.v_key_stop = tk.StringVar(value=self.cfg.get("hotkey_stop", "F10"))
         self.v_tp_drink = tk.BooleanVar(value=self.cfg["tp_auto_drink"])
         self.v_tp_jewel = tk.BooleanVar(value=self.cfg.get("tp_use_jewel", False))
@@ -3625,6 +3835,7 @@ class App:
         self.build_run_tab()
         self.build_fans_tab()
         self.build_tpl_tab()
+        self.build_pick_tab()
         self.build_settings_tab()
         self.build_donate_tab()
         self.on_mode_change()
@@ -3717,9 +3928,11 @@ class App:
     def build_run_tab(self):
         f = tb.Frame(self.nb, padding=14)
         self.nb.add(f, text="运行")
-        left = tb.Frame(f, width=int(320 * self.ui_scale()))
-        left.pack(side=LEFT, fill=Y, padx=(0, 14))
-        left.pack_propagate(False)
+        # 左边这栏内容很多：做成可以用滚轮上下滚动
+        louter, left = self.scrollable(f, padding=(0, 0, 8, 0))
+        louter.configure(width=int(338 * self.ui_scale()))
+        louter.pack(side=LEFT, fill=Y, padx=(0, 14))
+        louter.pack_propagate(False)
         right = tb.Frame(f)
         right.pack(side=LEFT, fill=BOTH, expand=True)
 
@@ -3797,7 +4010,7 @@ class App:
         self.lbl_ready = tb.Label(rf, text="", wraplength=int(270 * self.ui_scale()), justify=LEFT)
         self.lbl_ready.pack(anchor=W, pady=(8, 0))
         tb.Button(rf, text="去截模板", bootstyle="primary-link",
-                  command=lambda: self.nb.select(2)).pack(anchor=W)
+                  command=lambda: self.select_tab("模板")).pack(anchor=W)
 
 
         # 主题图：把自己喜欢的图片命名为 theme.png 放在程序旁边即可显示
@@ -4356,6 +4569,247 @@ class App:
                   "「测试识别」里分数在 0.75～0.85 之间的，可以把识别严格度调低一点。"):
             tb.Label(tips, text=t).pack(anchor=W, pady=2)
 
+    # ---------- 马娘 / 卡组页 ----------
+    def select_tab(self, name):
+        for t in self.nb.tabs():
+            if self.nb.tab(t, "text") == name:
+                self.nb.select(t)
+                return
+
+    PICK_ITEMS = {
+        "chara": ("指定育成马娘", "pick_chara", [
+            ("sel_chara", "马娘头像", "在选马娘画面，只框你要的那匹马娘的脸（不要框星星和觉醒等级）"),
+            ("sel_chara_title", "画面标题", "选马娘画面左上角「选择育成赛马娘」这几个字"),
+        ]),
+        "deck": ("指定支援卡组", "pick_deck", [
+            ("sel_deck", "支援卡组", "在支援卡组画面，框住整组 6 张卡（不要框到上面的卡组名称）"),
+            ("sel_copy", "「复制」按钮", "支援卡组画面右上角的「复制」，用来找换卡组的箭头"),
+        ]),
+    }
+
+    def build_pick_tab(self):
+        outer, f = self.scrollable(self.nb)
+        self.nb.add(outer, text="马娘/卡组")
+        s = self.ui_scale()
+        tb.Label(f, text="开始育成时自动选好马娘和支援卡组（定时重开、前台自动育成都适用）",
+                 font=(FONT, 11, "bold"), foreground=PALETTE["primary"]).pack(anchor=W, pady=(4, 2))
+        tb.Label(f, text="做法：让游戏停在那个画面 → 按下面的「截取」→ 在弹出的截图里框住它。截好后打开开关。",
+                 bootstyle="secondary", wraplength=int(820 * s), justify=LEFT).pack(anchor=W, pady=(0, 8))
+        self.pick_widgets = {}
+        self.pick_slots = {}
+        var = {"pick_chara": self.v_pick_chara, "pick_deck": self.v_pick_deck}
+        for gid, (title, cfg_key, items) in self.PICK_ITEMS.items():
+            box = tb.Labelframe(f, text=title, padding=14)
+            box.pack(fill=X, pady=(0, 12))
+            tb.Checkbutton(box, text=f"开启{title}", variable=var[cfg_key], bootstyle="success-round-toggle",
+                           command=lambda: self.save_settings(quiet=True)).pack(anchor=W, pady=(0, 8))
+            for key, name, desc in items:
+                row = tb.Frame(box)
+                row.pack(fill=X, pady=4)
+                pic = tb.Label(row, text="", width=14, anchor="center")
+                pic.pack(side=LEFT)
+                kind = {"sel_chara": "chara", "sel_deck": "deck"}.get(key)
+                if kind:  # 「＋」卡片：点了从储存的马娘 / 卡组里选
+                    slot = tb.Frame(row)
+                    slot.pack(side=LEFT, padx=(10, 0))
+                    self.plus_card(slot, int(74 * s), lambda k=kind: self.open_lib(k)).pack()
+                    cap = tb.Label(slot, text="", font=(FONT, 8), bootstyle="secondary")
+                    cap.pack(pady=(2, 0))
+                    self.pick_slots[kind] = cap
+                mid = tb.Frame(row)
+                mid.pack(side=LEFT, fill=X, expand=True, padx=12)
+                tb.Label(mid, text=name, font=(FONT, 10, "bold")).pack(anchor=W)
+                tb.Label(mid, text=desc, bootstyle="secondary", wraplength=int(480 * s), justify=LEFT).pack(anchor=W)
+                st = tb.Label(mid, text="")
+                st.pack(anchor=W)
+                tb.Button(row, text="截取", bootstyle="primary", width=8,
+                          command=lambda k=key: self.capture_template(k)).pack(side=RIGHT)
+                self.pick_widgets[key] = (pic, st)
+        tips = tb.Labelframe(f, text="说明", padding=14)
+        tips.pack(fill=X)
+        for t in ("选马娘：列表里没看到会用滚轮往下、往上翻着找；找不到就用当时选中的马娘。",
+                  "选卡组：不是指定的那组，就按右边的「›」换下一组，最多翻 25 次。",
+                  "定时重开时，「再次育成」本来就会沿用上次的马娘和卡组，通常只有第一次会真的去换。",
+                  "可以存好几个马娘 / 卡组：截取时取个名字存起来，以后点「＋」就能直接换，不用重截。"):
+            tb.Label(tips, text="◆ " + t, wraplength=int(820 * s), justify=LEFT).pack(anchor=W, pady=2)
+        self.refresh_pick()
+
+    def refresh_pick(self):
+        if not hasattr(self, "pick_widgets"):
+            return
+        self.pick_photos = getattr(self, "pick_photos", {})
+        s = self.ui_scale()
+        for key, (pic, st) in self.pick_widgets.items():
+            p = tpl_path(key)
+            if os.path.exists(p):
+                st.configure(text="✓ 已截取", bootstyle="success")
+                try:
+                    im = Image.open(p).convert("RGB")
+                    im.thumbnail((int(110 * s), int(80 * s)))
+                    self.pick_photos[key] = ImageTk.PhotoImage(im)
+                    pic.configure(image=self.pick_photos[key], text="")
+                except Exception:
+                    pic.configure(image="", text="（预览失败）")
+            else:
+                st.configure(text="✗ 还没截取", bootstyle="danger")
+                pic.configure(image="", text="（无）")
+        for kind, cap in getattr(self, "pick_slots", {}).items():
+            n = len(lib_list(kind))
+            cap.configure(text=f"已存 {n} 个，点＋选择" if n else "点＋截取 / 选择")
+            act = lib_active(kind)
+            if act and LIB_KEY[kind] in self.pick_widgets:
+                self.pick_widgets[LIB_KEY[kind]][1].configure(text=f"✓ 使用中：{act}", bootstyle="success")
+
+    def plus_card(self, parent, size, command):
+        """白色圆角卡片中间一个绿色「＋」（跟游戏里的空位一样）。"""
+        pad = max(3, size // 14)
+        cv = tk.Canvas(parent, width=size + pad, height=size + pad, highlightthickness=0,
+                       bg=PALETTE["bg"], cursor="hand2")
+
+        def rrect(x0, y0, x1, y1, r, **kw):
+            pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
+                   x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+            return cv.create_polygon(pts, smooth=True, **kw)
+
+        r = size // 6
+        rrect(pad, pad, size + pad - 1, size + pad - 1, r, fill="#e4dcc6", outline="")  # 影子
+        card = rrect(1, 1, size - 1, size - 1, r, fill="#ffffff", outline="#ddd6c4", width=2)
+        c, a, w = size / 2, size * 0.23, max(4, int(size * 0.11))
+        plus = "#7cc243"
+        cv.create_line(c - a, c, c + a, c, fill=plus, width=w, capstyle="round")
+        cv.create_line(c, c - a, c, c + a, fill=plus, width=w, capstyle="round")
+        cv.bind("<Enter>", lambda e: cv.itemconfigure(card, outline=PALETTE["success"]))
+        cv.bind("<Leave>", lambda e: cv.itemconfigure(card, outline="#ddd6c4"))
+        cv.bind("<Button-1>", lambda e: command())
+        return cv
+
+    def open_lib(self, kind):
+        """选择储存的马娘 / 支援卡组。"""
+        label = "马娘" if kind == "chara" else "支援卡组"
+        key = LIB_KEY[kind]
+        s = self.ui_scale()
+        old = getattr(self, "lib_win", None)
+        if old is not None and old.winfo_exists():
+            old.destroy()
+        win = tb.Toplevel(self.root)
+        self.lib_win = win
+        win.title(f"选择储存的{label}")
+        win.transient(self.root)
+        win.configure(background=PALETTE["bg"])
+        tb.Label(win, text=f"选择要用的{label}", font=(FONT, 12, "bold"),
+                 foreground=PALETTE["primary"]).pack(anchor=W, padx=16, pady=(14, 2))
+        tb.Label(win, text="点一下就会换成那个；点「＋」截一个新的存进来。", bootstyle="secondary").pack(anchor=W, padx=16)
+        grid = tb.Frame(win, padding=(16, 10, 16, 6))
+        grid.pack(fill=BOTH, expand=True)
+        cols = 4 if kind == "chara" else 2
+        tw, th = (int(96 * s), int(96 * s)) if kind == "chara" else (int(250 * s), int(110 * s))
+        active = lib_active(kind)
+        self.lib_photos = []
+
+        def use(name):
+            try:
+                lib_use(kind, name)
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"换不了：{e}", parent=win)
+                return
+            (self.v_pick_chara if kind == "chara" else self.v_pick_deck).set(True)
+            self.save_settings(quiet=True)
+            self.log(f"指定{label}换成「{name}」", "ok")
+            self.refresh_pick()
+            self.refresh_tree()
+            win.destroy()
+
+        def rename(name):
+            from tkinter import simpledialog
+            new = simpledialog.askstring(APP_NAME, "新的名称：", initialvalue=name, parent=win)
+            new = lib_clean_name(new or "")
+            if not new or new == name:
+                return
+            d = os.path.join(LIB_DIR, kind)
+            if os.path.exists(os.path.join(d, new + ".png")):
+                messagebox.showinfo(APP_NAME, "已经有同名的了", parent=win)
+                return
+            os.rename(os.path.join(d, name + ".png"), os.path.join(d, new + ".png"))
+            m = lib_meta()
+            if f"{kind}/{name}" in m:
+                m[f"{kind}/{new}"] = m.pop(f"{kind}/{name}")
+                with open(LIB_META, "w", encoding="utf-8") as f:
+                    json.dump(m, f, ensure_ascii=False, indent=1)
+            self.refresh_pick()
+            self.open_lib(kind)
+
+        def delete(name):
+            if messagebox.askyesno(APP_NAME, f"从储存里删除「{name}」？", parent=win):
+                lib_delete(kind, name)
+                self.refresh_pick()
+                self.open_lib(kind)
+
+        def capture_new():
+            win.destroy()
+            self.capture_template(key)
+
+        items = lib_list(kind)
+        for i, (name, path) in enumerate(items):
+            on = name == active
+            card = tk.Frame(grid, bg="#ffffff", cursor="hand2", highlightthickness=3,
+                            highlightbackground=PALETTE["success"] if on else "#ddd6c4")
+            card.grid(row=i // cols, column=i % cols, padx=6, pady=6, sticky="n")
+            try:
+                im = Image.open(path).convert("RGB")
+                im.thumbnail((tw, th))
+                ph = ImageTk.PhotoImage(im)
+                self.lib_photos.append(ph)
+                pic = tk.Label(card, image=ph, bg="#ffffff", width=tw, height=th)
+            except Exception:
+                pic = tk.Label(card, text="（预览失败）", bg="#ffffff")
+            pic.pack(padx=6, pady=(6, 2))
+            nm = tk.Label(card, text=("✓ " if on else "") + name, bg="#ffffff", font=(FONT, 9, "bold"),
+                          fg=PALETTE["success"] if on else PALETTE["fg"])
+            nm.pack()
+            for wdg in (card, pic, nm):
+                wdg.bind("<Button-1>", lambda e, n=name: use(n))
+            ops = tk.Frame(card, bg="#ffffff")
+            ops.pack(pady=(0, 4))
+            for txt, fn, col in (("改名", rename, PALETTE["info"]), ("删除", delete, PALETTE["danger"])):
+                b = tk.Label(ops, text=txt, bg="#ffffff", fg=col, font=(FONT, 8, "underline"), cursor="hand2")
+                b.pack(side=LEFT, padx=6)
+                b.bind("<Button-1>", lambda e, n=name, f=fn: f(n))
+        n = len(items)
+        plus = tb.Frame(grid)
+        plus.grid(row=n // cols, column=n % cols, padx=6, pady=6, sticky="n")
+        self.plus_card(plus, int(74 * s), capture_new).pack(pady=(int(10 * s), 2))
+        tb.Label(plus, text="截取新的", bootstyle="secondary").pack()
+        bottom = tb.Frame(win, padding=(16, 0, 16, 14))
+        bottom.pack(fill=X)
+        if os.path.exists(tpl_path(key)) and not active:
+            tb.Button(bottom, text="把现在用的存进来", bootstyle="success-outline",
+                      command=lambda: (win.destroy(), self.ask_lib_save(kind))).pack(side=LEFT)
+        tb.Button(bottom, text="关闭", bootstyle="secondary", command=win.destroy).pack(side=RIGHT)
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - win.winfo_reqwidth()) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - win.winfo_reqheight()) // 3)
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+
+    def ask_lib_save(self, kind):
+        """截好 sel_chara / sel_deck 后，问要不要存进库（取个名字）。"""
+        from tkinter import simpledialog
+        label = "马娘" if kind == "chara" else "支援卡组"
+        names = {n for n, _ in lib_list(kind)}
+        i = len(names) + 1
+        while f"{label}{i}" in names:
+            i += 1
+        name = simpledialog.askstring(APP_NAME, f"把这个{label}存起来，以后点「＋」就能直接选。\n取个名字（取消＝不存）：",
+                                      initialvalue=f"{label}{i}", parent=self.root)
+        name = lib_clean_name(name or "")
+        if not name:
+            return
+        if name in names and not messagebox.askyesno(APP_NAME, f"「{name}」已经有了，要覆盖吗？"):
+            return
+        if lib_save(kind, name, tpl_path(LIB_KEY[kind])):
+            self.log(f"已存进{label}库：{name}", "ok")
+        self.refresh_pick()
+
     # ---------- 打赏页 ----------
     def build_donate_tab(self):
         s = self.ui_scale()
@@ -4498,6 +4952,8 @@ class App:
                 cycle_run_now=bool(self.v_cycle_now.get()),
                 wait_training=bool(self.v_wait_training.get()),
                 front_wait_min=int(self.v_front_wait.get()),
+                pick_chara=bool(self.v_pick_chara.get()),
+                pick_deck=bool(self.v_pick_deck.get()),
                 front_plan=(self.plan_choices.index(self.v_front_plan.get())
                             if self.v_front_plan.get() in self.plan_choices else 0),
                 run_as_admin=bool(self.v_admin.get()),
@@ -4691,8 +5147,8 @@ class App:
 
         self.root.after(500, do)
 
-    def capture_template(self):
-        key = self.selected_key()
+    def capture_template(self, key=None):
+        key = key or self.selected_key()
         if key == "__newregion":
             return self.capture_new_region()
         if not key:
@@ -4731,6 +5187,10 @@ class App:
                     save_cfg(self.cfg)
                     self.log(f"已保存模板 {key}（{w}×{h}）", "ok")
                     self.refresh_tree()
+                    self.refresh_pick()
+                    kind = {"sel_chara": "chara", "sel_deck": "deck"}.get(key)
+                    if kind:
+                        self.root.after(200, lambda: self.ask_lib_save(kind))
 
             RegionSelector(self.root, img, f"框选：{key}", done)
 
@@ -4860,7 +5320,7 @@ class App:
     def handle_hotkeys(self):
         while not self.key_q.empty():
             name = self.key_q.get()
-            ks, kp = hotkey_id(self.cfg.get("hotkey_start", "F9")), hotkey_id(self.cfg.get("hotkey_stop", "F10"))
+            ks, kp = hotkey_id(self.cfg.get("hotkey_start", "F10")), hotkey_id(self.cfg.get("hotkey_stop", "F10"))
             running = self.bot is not None and self.bot.is_alive()
             if name == ks and ks == kp:
                 if running:
@@ -5107,10 +5567,7 @@ class App:
             btn_prev.configure(state=NORMAL if i > 0 else DISABLED)
             btn_next.configure(text="完成 ✓" if i == len(TUTORIAL) - 1 else "下一步")
             if tab is not None:
-                try:
-                    self.nb.select(tab)
-                except Exception:
-                    pass
+                self.select_tab(["运行", "育成收益", "模板", "设置", "打赏"][tab])
 
         def nxt():
             if state["i"] >= len(TUTORIAL) - 1:
