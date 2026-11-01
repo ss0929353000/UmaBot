@@ -78,10 +78,20 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.31"
+VERSION = "3.34"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.34", "2026-11-01", [
+        "调整：找指定马娘时，列表里没看到就先拉到最上面，再从上往下一页一页找，翻到底都没有才改用现在选的",
+    ]),
+    ("3.33", "2026-10-28", [
+        "调整：「运行」页的「今天已获得」下面分开显示「自动育成」和「其他」各拿了多少萝卜，和「育成收益」页对得上",
+        "修正：中途停止再启动、开始前没读到萝卜时，会拿很久以前的数字来算，把自己玩、领任务的萝卜算进这一轮",
+    ]),
+    ("3.32", "2026-10-27", [
+        "修正：开了「指定支援卡组」后，在选继承马娘画面把「重置」认成「复制」，一直空转不按「下项」",
+    ]),
     ("3.31", "2026-10-27", [
         "调整：启动 / 停止的默认快捷键都改成 F10，按一下启动、再按一下停止（原本用默认 F9 / F10 的会自动换过来）",
     ]),
@@ -882,6 +892,19 @@ LIB_META = os.path.join(LIB_DIR, "lib.json")
 LIB_KEY = {"chara": "sel_chara", "deck": "sel_deck"}
 
 
+def save_jewel_reading(v, start=None):
+    """存下最新读到的萝卜数量（「运行」页的「当前」）；今天还没有起点就顺便记起点。"""
+    st = load_state()
+    st["jewels"] = int(v)
+    st["jewels_t"] = datetime.now().strftime("%H:%M")
+    st["jewels_ts"] = time.time()
+    day = FanStore.day_of(datetime.now(), JEWEL_RESET_HOUR).isoformat()
+    log = st.setdefault("jewel_log", {})
+    if day not in log:
+        log[day] = {"n": int(start if start is not None else v), "manual": False}
+    save_state(st)
+
+
 def lib_meta():
     try:
         with open(LIB_META, encoding="utf-8") as f:
@@ -1372,7 +1395,9 @@ class Bot(threading.Thread):
         if not (0 <= px < w and 0 <= py < h):
             px, py = int(pt[0] / self.f), int(pt[1] / self.f)
             if not (0 <= px < w and 0 <= py < h):
-                return
+                self.log(f"「{label}」的位置在游戏窗口外面，没有点", "warn")
+                self.wait(0.5)
+                return False
         human_press(x + px, y + py, on)
         self.log(f"点击 {label}", "ok")
         changed = prev is None
@@ -1654,6 +1679,7 @@ class Bot(threading.Thread):
             if not after and r["jewels_before"] is None:
                 r["jewels_before"] = v
                 self.log(f"开始前宝石：{v:,}")
+                save_jewel_reading(v)
             elif after:
                 r["jewels_after"] = v
         self.jewel_prev = v
@@ -1702,9 +1728,12 @@ class Bot(threading.Thread):
             r = self.result
             jewels = None
             st = load_state()
-            if r["jewels_before"] is None and st.get("jewels") is not None:
+            # 开始前没读到：只有上次读到的数字够新（中间游戏是关着的）才拿来用，
+            # 不然中间自己玩、领任务拿到的萝卜会被算进这一轮
+            fresh = time.time() - st.get("jewels_ts", 0) < (float(self.cfg.get("cycle_minutes", 50)) + 30) * 60
+            if r["jewels_before"] is None and st.get("jewels") is not None and fresh:
                 r["jewels_before"] = st["jewels"]
-                self.log(f"本轮开始前没读到宝石，改用上一轮结束时的 {st['jewels']:,}")
+                self.log(f"本轮开始前没读到宝石，改用上次读到的 {st['jewels']:,}（{st.get('jewels_t', '')}）")
             if r["jewels_before"] is not None and r["jewels_after"] is not None:
                 jewels = r["jewels_after"] - r["jewels_before"]
                 if abs(jewels) > 3000:
@@ -1720,14 +1749,7 @@ class Bot(threading.Thread):
                 self.log(f"这轮没算出宝石：{miss}没读到数字（图标最高相似度 {self.jewel_best:.2f}）。"
                          f"可在「模板」页重截 flow_jewel，只框萝卜图标", "warn")
             if r["jewels_after"] is not None:
-                st["jewels"] = r["jewels_after"]
-                st["jewels_t"] = datetime.now().strftime("%H:%M")
-                day = FanStore.day_of(datetime.now(), JEWEL_RESET_HOUR).isoformat()
-                log = st.setdefault("jewel_log", {})
-                if day not in log:
-                    first = r["jewels_before"] if r["jewels_before"] is not None else r["jewels_after"]
-                    log[day] = {"n": int(first), "manual": False}
-                save_state(st)
+                save_jewel_reading(r["jewels_after"], r["jewels_before"])
             if r["gain"] is not None:
                 self.run_fans += r["gain"]
             if (r["gain"] is not None or jewels is not None) and self.fans:
@@ -1978,7 +2000,11 @@ class Bot(threading.Thread):
         self.chara_ok = not self.cfg.get("pick_chara")
         self.deck_ok = not self.cfg.get("pick_deck")
         self.chara_tries = self.deck_tries = 0
-        self.chara_scroll_dir = -1
+        self.deck_recheck = False
+        self.chara_phase = "top"   # 列表里没看到：先拉到最上面（top），再从上往下找（down）
+        self.chara_scrolls = 0
+        self.chara_still = 0
+        self.chara_prev = None
 
     def chara_selected(self, img, pt):
         """选中的马娘头像四角有绿色的框：看左上、右上两个角。"""
@@ -2017,35 +2043,54 @@ class Bot(threading.Thread):
                     self.click(pt, "指定的育成马娘")
                     self.wait(0.6)
                     return True
-                # 列表里没看到：用滚轮翻列表（先往下，再往上）
-                self.chara_tries += 1
-                if self.chara_tries > 24:
-                    self.log("列表里找不到指定的马娘（sel_chara），用现在选的", "warn")
+                # 列表里没看到：先一口气拉到最上面，再从上往下一点一点翻着找
+                x0, y0 = int(ttl[0] + 0.299 * h), int(ttl[1] + 0.511 * h)
+                r = int(0.2 * h)
+                reg = cv2.cvtColor(img[max(0, y0 - r):y0 + r, max(0, x0 - r):x0 + r], cv2.COLOR_BGR2GRAY)
+                prev, self.chara_prev = self.chara_prev, reg
+                moved = prev is None or prev.shape != reg.shape or float(cv2.absdiff(prev, reg).mean()) > 2
+                self.chara_still = 0 if moved else self.chara_still + 1
+                self.chara_scrolls += 1
+                if self.chara_phase == "top":
+                    if (self.chara_still >= 1 and self.chara_scrolls > 1) or self.chara_scrolls > 12:
+                        self.chara_phase = "down"
+                        self.chara_still = 0
+                        self.log("马娘列表已拉到最上面，从上往下找")
+                elif self.chara_still >= 2 or self.chara_scrolls > 60:
+                    self.log("列表从上到下都找不到指定的马娘（sel_chara），用现在选的", "warn")
                     self.chara_ok = True
                     return False
-                if self.chara_tries == 10:
-                    self.chara_scroll_dir = 1
-                x = self.rect[0] + int((ttl[0] + 0.299 * h) / self.f)
-                y = self.rect[1] + int((ttl[1] + 0.511 * h) / self.f)
+                x = self.rect[0] + int(x0 / self.f)
+                y = self.rect[1] + int(y0 / self.f)
                 real_move(x, y, 0.2)
-                pyautogui.scroll(self.chara_scroll_dir * 3, x, y)
+                pyautogui.scroll(15 if self.chara_phase == "top" else -3, x, y)
                 self.wait(0.8)
                 return True
         if not self.deck_ok and {"sel_deck", "sel_copy"} <= set(self.tpls):
             cp = self.find(img, "sel_copy", 0.8)
+            # 「复制」在支援卡组画面的上方；选继承马娘画面下面的「重置」按钮长得很像，不能当成「复制」
+            arrow = (int(cp[0] + 0.051 * h), int(cp[1] + 0.266 * h)) if cp else None
+            if cp and (cp[1] > 0.35 * h or not (0 <= arrow[0] < img.shape[1] and 0 <= arrow[1] < h)):
+                cp = None
             if cp:
                 if self.find(img, "sel_deck", 0.78):
                     if self.deck_tries:
                         self.log("已换到指定的支援卡组", "ok")
                     self.deck_ok = True
                     return False
+                # 画面可能还在滑进来：等一下再看一次，两次都不是才换下一组
+                if not getattr(self, "deck_recheck", False):
+                    self.deck_recheck = True
+                    self.wait(0.8)
+                    return True
+                self.deck_recheck = False
                 self.deck_tries += 1
                 if self.deck_tries > 25:
                     self.log("翻了 25 次都没看到指定的支援卡组（sel_deck），用现在的卡组", "warn")
                     self.deck_ok = True
                     return False
                 # 卡组右边的「›」箭头：在「复制」按钮的右下方
-                self.click((int(cp[0] + 0.051 * h), int(cp[1] + 0.266 * h)), "下一个支援卡组")
+                self.click(arrow, "下一个支援卡组")
                 self.wait(0.9)
                 return True
         return False
@@ -4051,6 +4096,8 @@ class App:
         self.lbl_jgain.grid(row=0, column=2, sticky=W, padx=(24, 0))
         self.lbl_jyest = tb.Label(jf, text="", font=(FONT, 12, "bold"), foreground=PALETTE["primary"])
         self.lbl_jyest.grid(row=1, column=2, sticky=W, padx=(24, 0), pady=(6, 0))
+        self.lbl_jsplit = tb.Label(jf, text="", bootstyle="secondary", font=(FONT, 9))
+        self.lbl_jsplit.grid(row=2, column=1, columnspan=2, sticky=W, padx=(24, 0), pady=(4, 0))
         jf.columnconfigure(3, weight=1)
         self.tick_jewel()
 
@@ -4140,6 +4187,9 @@ class App:
             sub = tb.Label(card, text="", bootstyle="secondary", font=(FONT, 9))
             sub.pack(anchor=W)
             self.fan_cards[key] = (v, sub)
+        tb.Label(f, text="宝石只算每一轮自动育成前后多了多少；「运行」页的「今天已获得」是萝卜总数的变化，"
+                         "还包含任务、礼物、自己玩拿到的（和花掉的），所以两边会不一样。",
+                 bootstyle="secondary", font=(FONT, 9)).pack(anchor=W, pady=(6, 0))
 
         mid = tb.Labelframe(f, text="最近 14 天", padding=10)
         mid.pack(fill=X, pady=12)
@@ -4290,6 +4340,7 @@ class App:
             self.log(f"已更新当前萝卜：{int(t):,}，今天已获得 {int(t) - log[day]['n']:+,}", "ok")
         st["jewels"] = int(t)
         st["jewels_t"] = datetime.now().strftime("%H:%M")
+        st["jewels_ts"] = time.time()
         save_state(st)
         self.v_jewel_now.set("")
         self.refresh_jewel_box()
@@ -4325,6 +4376,14 @@ class App:
             t = st.get("jewels_t")
             self.lbl_jnow.configure(text=f"当前：{cur:,}" + (f"（{t} 更新）" if t else ""))
             self.lbl_jgain.configure(text=f"今天已获得：{cur - today['n']:+,}" if today else "")
+            if today:
+                auto = self.fans.daily(JEWEL_RESET_HOUR).get(FanStore.day_of(datetime.now(), JEWEL_RESET_HOUR),
+                                                              (0, 0, 0))[1]
+                other = cur - today["n"] - auto
+                self.lbl_jsplit.configure(
+                    text=f"其中自动育成 {auto:+,}（＝「育成收益」页）　其他 {other:+,}（任务、礼物、自己玩、花掉的）")
+            else:
+                self.lbl_jsplit.configure(text="")
         else:
             self.lbl_jnow.configure(text="当前：—")
             self.lbl_jgain.configure(text="")
@@ -4354,7 +4413,7 @@ class App:
         w = [daily.get(today - timedelta(days=i), z) for i in range(7)]
         w_sum, w_j, w_cnt = (sum(x[k] for x in w) for k in range(3))
         cards = {
-            "today": (f"粉丝 +{fmt_fans(t_sum)}", f"宝石 {t_j:+,}，{t_cnt} 次育成"),
+            "today": (f"粉丝 +{fmt_fans(t_sum)}", f"宝石 {t_j:+,}（自动育成），{t_cnt} 次育成"),
             "yesterday": (f"粉丝 +{fmt_fans(y_sum)}", f"宝石 {y_j:+,}，{y_cnt} 次育成"),
             "week": (f"粉丝 +{fmt_fans(w_sum)}", f"宝石 {w_j:+,}，{w_cnt} 次育成"),
             "avg": (f"粉丝 +{fmt_fans(w_sum // w_cnt) if w_cnt else 0}",
@@ -4627,7 +4686,7 @@ class App:
                 self.pick_widgets[key] = (pic, st)
         tips = tb.Labelframe(f, text="说明", padding=14)
         tips.pack(fill=X)
-        for t in ("选马娘：列表里没看到会用滚轮往下、往上翻着找；找不到就用当时选中的马娘。",
+        for t in ("选马娘：列表里没看到会先拉到最上面，再从上往下翻着找；翻到底都没有就用当时选中的马娘。",
                   "选卡组：不是指定的那组，就按右边的「›」换下一组，最多翻 25 次。",
                   "定时重开时，「再次育成」本来就会沿用上次的马娘和卡组，通常只有第一次会真的去换。",
                   "可以存好几个马娘 / 卡组：截取时取个名字存起来，以后点「＋」就能直接换，不用重截。"):
