@@ -78,10 +78,27 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.34"
+VERSION = "3.39"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.39", "2026-11-06", [
+        "修正：改了目标粉丝数等设置后直接关掉程序不会保存；现在设置一改就自动保存，关闭前也会再存一次",
+    ]),
+    ("3.38", "2026-11-04", [
+        "修正：萝卜数量里的 8 有时会读成 6（例如 18,824 读成 16,824）；现在会看数字里有几个圈来分辨 8 和 6、9、0",
+    ]),
+    ("3.37", "2026-11-03", [
+        "修正：游戏被别的窗口挡住时会一直暂停到你回来（会卡在主页很久）；现在开着「自动切到最前面」时每隔几秒会再试，"
+        "还会点游戏的标题列、把挡住的窗口最小化",
+    ]),
+    ("3.36", "2026-11-02", [
+        "新增：指定剧本。在「马娘/卡组/剧本」页截好剧本的大标题并打开开关，到剧本选择画面会按「›」翻到那个剧本再按「下项」",
+        "新增：剧本也可以存好几个，点「＋」直接换",
+    ]),
+    ("3.35", "2026-11-02", [
+        "修正：游戏开着但停在标题画面（TAP TO START）时按启动，会卡住不动；现在认不出画面会先点进主页再开始",
+    ]),
     ("3.34", "2026-11-01", [
         "调整：找指定马娘时，列表里没看到就先拉到最上面，再从上往下一页一页找，翻到底都没有才改用现在选的",
     ]),
@@ -301,11 +318,14 @@ TEMPLATE_GROUPS = [
         "end_next": "领奖画面的「下项」（左半边，避开闪光圈）",
         "end_next_b": "结算画面的「下项」（左半边，避开闪光圈）",
     }),
-    ("指定马娘 / 支援卡组（「运行」页打开开关才会用）", "sel_", {
+    ("指定剧本 / 马娘 / 支援卡组（「马娘/卡组/剧本」页打开开关才会用）", "sel_", {
         "sel_chara_title": "选马娘画面左上角「选择育成赛马娘」这几个字",
         "sel_chara": "要育成的那匹马娘在列表里的头像（只框脸，不要框星星和觉醒等级）",
         "sel_deck": "要用的支援卡组：整组 6 张卡（框住 6 张卡，不要框到上面的卡组名称）",
         "sel_copy": "支援卡组画面右上角的「复制」按钮（用来找换卡组的箭头）",
+        "sel_scen_title": "剧本选择画面左上角「剧本选择」这几个字",
+        "sel_scen": "要用的剧本：画面中间那个剧本的大标题字",
+        "sel_scen_next": "剧本选择画面右边的「›」箭头（换下一个剧本）",
     }),
     ("前台自动育成（常规养成＋游戏的「自动」）", "fa_", {
         "fa_start": "最终确认（常规养成）底部的「育成开始！」，只框「育成开」三个字",
@@ -376,6 +396,7 @@ DEFAULT_CFG = {
     "front_wait_min": 30,      # 前台自动育成：按下游戏的「自动」后，先等几分钟才开始看画面     # 时间到时游戏里还在「自主训练中」，就等它结束再重开
     "pick_chara": False,       # 选马娘画面：选「模板」页截的那匹马娘（sel_chara）
     "pick_deck": False,        # 支援卡组画面：翻到「模板」页截的那组卡（sel_deck）
+    "pick_scen": False,        # 剧本选择画面：按「›」翻到截好的那个剧本（sel_scen）
     "front_plan": 0,           # 前台自动育成：「自动育成」视窗里用第几个计划（由上往下数）；0＝不指定，用游戏里现在选的
     "run_as_admin": False,     # 以管理员身份运行（UU 加速器是管理员权限时，模拟的鼠标才会被它接收）
     "hotkey_start": "F10",     # 按这个键开始运行（「无」＝不用）
@@ -609,9 +630,25 @@ def grab_screen():
 
 
 def force_foreground(hwnd):
-    """Windows 会挡住后台程序抢前台，先按一下 Alt 再切换。"""
+    """Windows 会挡住后台程序抢前台：先还原窗口、按一下 Alt、借用前台程序的输入队列，再切换。"""
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
+    except Exception:
+        pass
+    u32 = ctypes.windll.user32
+    cur = attached = None
+    try:
+        cur = ctypes.windll.kernel32.GetCurrentThreadId()
+        fg = win32gui.GetForegroundWindow()
+        fg_t = win32process.GetWindowThreadProcessId(fg)[0] if fg else 0
+        if fg_t and fg_t != cur and u32.AttachThreadInput(cur, fg_t, True):
+            attached = fg_t
+    except Exception:
+        pass
     try:
         win32api.keybd_event(0x12, 0, 0, 0)
+        win32gui.BringWindowToTop(hwnd)
         win32gui.SetForegroundWindow(hwnd)
     except Exception:
         pass
@@ -620,6 +657,29 @@ def force_foreground(hwnd):
             win32api.keybd_event(0x12, 0, 2, 0)
         except Exception:
             pass
+        if attached:
+            try:
+                u32.AttachThreadInput(cur, attached, False)
+            except Exception:
+                pass
+
+
+def click_caption(hwnd):
+    """点一下游戏窗口的标题列（不会点到游戏画面），用真的点击把游戏切到最前面。
+    标题列被别的窗口挡住就不点，回传 False。"""
+    try:
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        _, cy = win32gui.ClientToScreen(hwnd, (0, 0))
+        if cy - t < 12:   # 没有标题列（全屏 / 无边框）
+            return False
+        x, y = (l + r) // 2, (t + cy) // 2
+        at = win32gui.WindowFromPoint((x, y))
+        if at != hwnd and win32gui.GetAncestor(at, 2) != hwnd:
+            return False
+        human_press(x, y, False)
+        return True
+    except Exception:
+        return False
 
 
 SKIP_CLASSES = {"Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW",
@@ -889,7 +949,9 @@ def save_meta(meta):
 # ---- 马娘 / 支援卡组库：可以存好几个，用的时候选一个复制成 sel_chara / sel_deck ----
 LIB_DIR = os.path.join(TPL_DIR, "library")
 LIB_META = os.path.join(LIB_DIR, "lib.json")
-LIB_KEY = {"chara": "sel_chara", "deck": "sel_deck"}
+LIB_KEY = {"chara": "sel_chara", "deck": "sel_deck", "scen": "sel_scen"}
+LIB_LABEL = {"chara": "马娘", "deck": "支援卡组", "scen": "剧本"}
+LIB_KIND = {v: k for k, v in LIB_KEY.items()}
 
 
 def save_jewel_reading(v, start=None):
@@ -1118,6 +1180,38 @@ def _digit_feat(gray, x, y, w, h, size=24):
     return v / (np.linalg.norm(v) + 1e-6)
 
 
+def glyph_holes(binm):
+    """数字里有几个封闭的洞（8 有两个；6、9、0、4 有一个），回传每个洞中心的高度比例（0＝顶、1＝底）。"""
+    p = np.pad(binm.astype(np.uint8), 1)
+    n, _, st, cen = cv2.connectedComponentsWithStats((1 - p).astype(np.uint8), 4)
+    out = []
+    for k in range(1, n):
+        x, y, w, h, a = st[k]
+        if x == 0 or y == 0 or x + w == p.shape[1] or y + h == p.shape[0] or a < 2:
+            continue
+        out.append((cen[k][1] - 1) / max(1, binm.shape[0]))
+    return out
+
+
+def pick_digit(labels, sims, holes):
+    """按相似度挑数字，再用「洞」的数量排除不可能的（小字的 6 和 8 很像，但 8 有两个洞）。"""
+    allowed = None
+    if len(holes) >= 2:
+        allowed = {"8"}
+    elif len(holes) == 1:
+        allowed = set("04569")
+        if holes[0] > 0.58:
+            allowed.discard("9")
+        if holes[0] < 0.40:
+            allowed.discard("6")
+    order = np.argsort(-sims)
+    for k in order:
+        if allowed is None or labels[k] in allowed:
+            return labels[k], float(sims[k])
+    k = int(order[0])
+    return labels[k], float(sims[k])
+
+
 def read_jewels(img, icon, thr=0.8):
     """找到顶部栏的彩色萝卜图标，读取它右边的宝石数量。"""
     if icon is None or icon.shape[0] > img.shape[0] or icon.shape[1] > img.shape[1]:
@@ -1134,7 +1228,10 @@ def read_jewels(img, icon, thr=0.8):
     cs = [(st[i][0], st[i][1], st[i][2], st[i][3], i) for i in range(1, n) if st[i][4] >= 6 and st[i][3] >= 4]
     if not cs:
         return None
-    H = max(c[3] for c in cs)
+    # 数字都在同一行、一样高：挑「同高同行」最多的那组，背景里颜色相近的杂点不算
+    best = max(cs, key=lambda c: sum(abs(o[1] - c[1]) <= 2 and abs(o[3] - c[3]) <= 2 for o in cs))
+    Y0, H = best[1], best[3]
+    cs = [c for c in cs if c[1] >= Y0 - 2 and c[1] + c[3] <= Y0 + H + 3]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).astype(np.float32)
     refs = topbar_refs()
     txt = ""
@@ -1143,8 +1240,8 @@ def read_jewels(img, icon, thr=0.8):
             continue  # 逗号
         if refs:
             sims = refs[1] @ _digit_feat(gray, X, Y, W, Hh)
-            k = int(np.argmax(sims))
-            txt += refs[0][k] if sims[k] > 0.5 else "?"
+            d, sc = pick_digit(refs[0], sims, glyph_holes(lab[Y:Y + Hh, X:X + W] == i))
+            txt += d if sc > 0.5 else "?"
             continue
         g = _norm_glyph(lab[Y:Y + Hh, X:X + W] == i)
         best, score = "?", 0.45
@@ -1269,20 +1366,28 @@ class Bot(threading.Thread):
             return None
         if is_foreground(hwnd):
             return hwnd
-        if self.cfg.get("auto_focus"):
-            force_foreground(hwnd)
-            self.wait(0.5)
-            if is_foreground(hwnd):
-                return hwnd
-        self.log("游戏窗口不在最前面，已暂停点击。切回游戏后会自动继续", "warn")
+        auto = self.cfg.get("auto_focus")
+        if auto and self.grab_focus(hwnd):
+            return hwnd
+        self.log("游戏窗口不在最前面，已暂停点击。" + ("每隔几秒会再试着切回游戏" if auto else "切回游戏后会自动继续"),
+                 "warn")
         self.state_text = "已暂停：请切回游戏"
         t0 = time.time()
+        tries = loops = 0
         while not self.stop_evt.is_set():
             self.wait(1)
             hwnd = find_window(self.cfg["window_title"])
             if not hwnd:
                 self.state_text = None
                 return None
+            loops += 1
+            if auto and loops % 5 == 0:
+                tries += 1
+                if tries == 2:   # 还是切不回来：把挡在前面的窗口收起来
+                    n = minimize_other_windows(hwnd) if self.cfg.get("minimize_others", True) else 0
+                    if n:
+                        self.log(f"已把挡在前面的 {n} 个窗口最小化")
+                self.grab_focus(hwnd)
             if is_foreground(hwnd):
                 self.paused += time.time() - t0
                 self.state_text = None
@@ -1291,6 +1396,17 @@ class Bot(threading.Thread):
                 return hwnd
         self.state_text = None
         return None
+
+    def grab_focus(self, hwnd):
+        """试着把游戏切到最前面：先用系统的方法，不行就点一下游戏的标题列。"""
+        force_foreground(hwnd)
+        self.wait(0.5)
+        if is_foreground(hwnd):
+            return True
+        if click_caption(hwnd):
+            self.wait(0.5)
+            return is_foreground(hwnd)
+        return False
 
     def prepare(self, full_h):
         """按窗口高度准备模板：识别用缩小版，萝卜图标保留原尺寸版。"""
@@ -1709,6 +1825,7 @@ class Bot(threading.Thread):
     def restart_auto(self):
         self.reset_pick()
         self.clear_desktop()
+        self.ensure_in_game()
         self.tp_out = None
         self.result = {"gain": None, "jewels_before": None, "jewels_after": None}
         self.jewel_prev = None
@@ -1999,6 +2116,9 @@ class Bot(threading.Thread):
     def reset_pick(self):
         self.chara_ok = not self.cfg.get("pick_chara")
         self.deck_ok = not self.cfg.get("pick_deck")
+        self.scen_ok = not self.cfg.get("pick_scen")
+        self.scen_tries = 0
+        self.scen_recheck = False
         self.chara_tries = self.deck_tries = 0
         self.deck_recheck = False
         self.chara_phase = "top"   # 列表里没看到：先拉到最上面（top），再从上往下找（down）
@@ -2026,6 +2146,35 @@ class Bot(threading.Thread):
         if not hasattr(self, "chara_ok"):
             self.reset_pick()
         h = img.shape[0]
+        if not getattr(self, "scen_ok", True) and {"sel_scen", "sel_scen_title"} <= set(self.tpls):
+            ttl = self.find(img, "sel_scen_title", 0.8)
+            if ttl:
+                if self.find(img, "sel_scen", 0.72):
+                    if self.scen_tries:
+                        self.log("已换到指定的剧本", "ok")
+                    self.scen_ok = True
+                    return False
+                if not self.scen_recheck:   # 换剧本有动画：等一下再看一次
+                    self.scen_recheck = True
+                    self.wait(1)
+                    return True
+                self.scen_recheck = False
+                self.scen_tries += 1
+                if self.scen_tries > 20:
+                    self.log("翻了 20 次都没看到指定的剧本（sel_scen），用现在的剧本", "warn")
+                    self.scen_ok = True
+                    return False
+                # 右边的「›」：有截 sel_scen_next 就用它，没有就按标题的位置推算
+                nx = self.find(img, "sel_scen_next", 0.7) if "sel_scen_next" in self.tpls else None
+                if not nx:
+                    nx = (int(ttl[0] + 0.6495 * h), int(ttl[1] + 0.320 * h))
+                if not (0 <= nx[0] < img.shape[1] and 0 <= nx[1] < h):
+                    self.log("找不到换剧本的「›」箭头，用现在的剧本", "warn")
+                    self.scen_ok = True
+                    return False
+                self.click(nx, "下一个剧本")
+                self.wait(0.8)
+                return True
         if not self.chara_ok and {"sel_chara", "sel_chara_title"} <= set(self.tpls):
             ttl = self.find(img, "sel_chara_title", 0.8)
             if ttl:
@@ -2197,6 +2346,26 @@ class Bot(threading.Thread):
                 self.save_debug_shot()
                 self.log("这一轮卡住了，30 秒后从目前的画面接着试", "warn")
                 self.wait(30)
+
+    def ensure_in_game(self):
+        """开始一轮前看一下画面：在主页或认得出的流程画面就直接开始；
+        什么都认不出（标题画面「TAP TO START」、公告、读取中）就先点进主页。"""
+        if not find_window(self.cfg["window_title"]):
+            return
+        skip = ("flow_menu", "flow_jewel", "err_")   # 标题画面右下角的「≡」长得像菜单按钮，不算
+        keys = [k for k in self.tpls if k.startswith(("flow_", "end_", "fa_", "sel_", "btn_"))
+                and not k.startswith(skip)]
+        for _ in range(6):
+            if self.stop_evt.is_set():
+                return
+            img = self.capture()
+            if img is None:
+                return
+            if any(self.find(img, k, self.STEP_THR.get(k)) for k in keys):
+                return
+            self.wait(1)
+        self.log("认不出现在的画面（可能停在标题画面），先点进主页")
+        self.enter_home()
 
     def front_career(self):
         """一轮：主页 → 育成 → 常规养成 → 缩短事件 → 点「自动」→ 等它跑完 → 结束育成、领奖 → 回到「再次育成」/主页。"""
@@ -3833,6 +4002,7 @@ class App:
         fp = int(self.cfg.get("front_plan", 0) or 0)
         self.v_pick_chara = tk.BooleanVar(value=self.cfg.get("pick_chara", False))
         self.v_pick_deck = tk.BooleanVar(value=self.cfg.get("pick_deck", False))
+        self.v_pick_scen = tk.BooleanVar(value=self.cfg.get("pick_scen", False))
         self.v_front_plan = tk.StringVar(value=self.plan_choices[fp if 0 <= fp < len(self.plan_choices) else 0])
         self.v_admin = tk.BooleanVar(value=self.cfg.get("run_as_admin", False))
         self.v_key_start = tk.StringVar(value=self.cfg.get("hotkey_start", "F10"))
@@ -3884,6 +4054,12 @@ class App:
         self.build_settings_tab()
         self.build_donate_tab()
         self.on_mode_change()
+        # 设置一改就自动存（停手 1 秒后存），关闭程序前也会再存一次
+        self._autosave_job = None
+        skip = {"v_jewel_now", "v_fan_manual", "v_jewel_manual"}
+        for name, v in list(vars(self).items()):
+            if name.startswith("v_") and name not in skip and isinstance(v, tk.Variable):
+                v.trace_add("write", lambda *a: self.schedule_autosave())
 
         root.after(150, self.poll)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -4644,19 +4820,24 @@ class App:
             ("sel_deck", "支援卡组", "在支援卡组画面，框住整组 6 张卡（不要框到上面的卡组名称）"),
             ("sel_copy", "「复制」按钮", "支援卡组画面右上角的「复制」，用来找换卡组的箭头"),
         ]),
+        "scen": ("指定剧本", "pick_scen", [
+            ("sel_scen", "剧本标志", "在剧本选择画面，框住中间那个剧本的大标题字（例如「午式駿大祭」那块）"),
+            ("sel_scen_title", "画面标题", "剧本选择画面左上角「剧本选择」这几个字"),
+            ("sel_scen_next", "右边「›」箭头", "剧本选择画面右边换下一个剧本的箭头（可不截，会按标题位置推算）"),
+        ]),
     }
 
     def build_pick_tab(self):
         outer, f = self.scrollable(self.nb)
-        self.nb.add(outer, text="马娘/卡组")
+        self.nb.add(outer, text="马娘/卡组/剧本")
         s = self.ui_scale()
-        tb.Label(f, text="开始育成时自动选好马娘和支援卡组（定时重开、前台自动育成都适用）",
+        tb.Label(f, text="开始育成时自动选好剧本、马娘和支援卡组（定时重开、前台自动育成都适用）",
                  font=(FONT, 11, "bold"), foreground=PALETTE["primary"]).pack(anchor=W, pady=(4, 2))
         tb.Label(f, text="做法：让游戏停在那个画面 → 按下面的「截取」→ 在弹出的截图里框住它。截好后打开开关。",
                  bootstyle="secondary", wraplength=int(820 * s), justify=LEFT).pack(anchor=W, pady=(0, 8))
         self.pick_widgets = {}
         self.pick_slots = {}
-        var = {"pick_chara": self.v_pick_chara, "pick_deck": self.v_pick_deck}
+        var = {"pick_chara": self.v_pick_chara, "pick_deck": self.v_pick_deck, "pick_scen": self.v_pick_scen}
         for gid, (title, cfg_key, items) in self.PICK_ITEMS.items():
             box = tb.Labelframe(f, text=title, padding=14)
             box.pack(fill=X, pady=(0, 12))
@@ -4667,7 +4848,7 @@ class App:
                 row.pack(fill=X, pady=4)
                 pic = tb.Label(row, text="", width=14, anchor="center")
                 pic.pack(side=LEFT)
-                kind = {"sel_chara": "chara", "sel_deck": "deck"}.get(key)
+                kind = LIB_KIND.get(key)
                 if kind:  # 「＋」卡片：点了从储存的马娘 / 卡组里选
                     slot = tb.Frame(row)
                     slot.pack(side=LEFT, padx=(10, 0))
@@ -4744,7 +4925,7 @@ class App:
 
     def open_lib(self, kind):
         """选择储存的马娘 / 支援卡组。"""
-        label = "马娘" if kind == "chara" else "支援卡组"
+        label = LIB_LABEL[kind]
         key = LIB_KEY[kind]
         s = self.ui_scale()
         old = getattr(self, "lib_win", None)
@@ -4771,7 +4952,7 @@ class App:
             except Exception as e:
                 messagebox.showerror(APP_NAME, f"换不了：{e}", parent=win)
                 return
-            (self.v_pick_chara if kind == "chara" else self.v_pick_deck).set(True)
+            {"chara": self.v_pick_chara, "deck": self.v_pick_deck, "scen": self.v_pick_scen}[kind].set(True)
             self.save_settings(quiet=True)
             self.log(f"指定{label}换成「{name}」", "ok")
             self.refresh_pick()
@@ -4853,7 +5034,7 @@ class App:
     def ask_lib_save(self, kind):
         """截好 sel_chara / sel_deck 后，问要不要存进库（取个名字）。"""
         from tkinter import simpledialog
-        label = "马娘" if kind == "chara" else "支援卡组"
+        label = LIB_LABEL[kind]
         names = {n for n, _ in lib_list(kind)}
         i = len(names) + 1
         while f"{label}{i}" in names:
@@ -5002,7 +5183,13 @@ class App:
         else:
             self.lbl_ready.configure(text=f"必需模板 {done}/{len(req)} 已齐，可以启动", bootstyle="success")
 
-    def save_settings(self, quiet=False):
+    def schedule_autosave(self):
+        if self._autosave_job:
+            self.root.after_cancel(self._autosave_job)
+        self._autosave_job = self.root.after(1000, lambda: self.save_settings(quiet=True, silent=True))
+
+    def save_settings(self, quiet=False, silent=False):
+        self._autosave_job = None
         try:
             self.cfg.update(
                 mode=self.v_mode.get(),
@@ -5013,6 +5200,7 @@ class App:
                 front_wait_min=int(self.v_front_wait.get()),
                 pick_chara=bool(self.v_pick_chara.get()),
                 pick_deck=bool(self.v_pick_deck.get()),
+                pick_scen=bool(self.v_pick_scen.get()),
                 front_plan=(self.plan_choices.index(self.v_front_plan.get())
                             if self.v_front_plan.get() in self.plan_choices else 0),
                 run_as_admin=bool(self.v_admin.get()),
@@ -5043,7 +5231,8 @@ class App:
                 auto_update=bool(self.v_auto_update.get()),
             )
         except (tk.TclError, ValueError):
-            messagebox.showerror(APP_NAME, "有设置项不是有效数字，请检查后再保存")
+            if not silent:   # 自动保存时（例如数字还没打完）先不跳视窗
+                messagebox.showerror(APP_NAME, "有设置项不是有效数字，请检查后再保存")
             return False
         save_cfg(self.cfg)
         try:
@@ -5247,7 +5436,7 @@ class App:
                     self.log(f"已保存模板 {key}（{w}×{h}）", "ok")
                     self.refresh_tree()
                     self.refresh_pick()
-                    kind = {"sel_chara": "chara", "sel_deck": "deck"}.get(key)
+                    kind = LIB_KIND.get(key)
                     if kind:
                         self.root.after(200, lambda: self.ask_lib_save(kind))
 
@@ -5831,6 +6020,11 @@ class App:
         self.root.after(300, self.root.destroy)
 
     def on_close(self):
+        if self._autosave_job:
+            self.root.after_cancel(self._autosave_job)
+        if not self.save_settings(quiet=True, silent=True):
+            if not messagebox.askyesno(APP_NAME, "有设置项不是有效数字，这次的修改存不了。\n还是要关闭吗？"):
+                return
         self.stop()
         self.root.destroy()
 
