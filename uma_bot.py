@@ -78,10 +78,13 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.41"
+VERSION = "3.42"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.42", "2026-11-26", [
+        "修正：「育成收益」的育成次数把每次按启动后的第一轮（只开新育成、没有结束育成）也算进去，次数会多算、平均粉丝变少",
+    ]),
     ("3.41", "2026-11-25", [
         "调整：后台点击多了两种方式；「测试后台模式」会自动一种一种试，找到游戏有反应的就记下来",
     ]),
@@ -1454,7 +1457,9 @@ class FanStore:
             for r in self.records:
                 d = self.day_of(r["t"], reset_hour)
                 s, j, c = out.get(d, (0, 0, 0))
-                out[d] = (s + (r.get("gain") or 0), j + (r.get("jewels") or 0), c + 1)
+                # 只有真的结束了一次育成（有读到粉丝）才算一次；按启动后第一轮只是开新育成，不算
+                done = 1 if r.get("gain") is not None else 0
+                out[d] = (s + (r.get("gain") or 0), j + (r.get("jewels") or 0), c + done)
         return out
 
 
