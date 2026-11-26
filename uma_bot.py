@@ -78,10 +78,17 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.39"
+VERSION = "3.41"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.41", "2026-11-25", [
+        "调整：后台点击多了两种方式；「测试后台模式」会自动一种一种试，找到游戏有反应的就记下来",
+    ]),
+    ("3.40", "2026-11-25", [
+        "新增：后台模式（实验）。开启后直接对游戏窗口截图和点击，不切到前面、不动鼠标，可以同时玩别的游戏",
+        "新增：「设置」页的「测试后台模式」按钮，可以先测这台电脑能不能用后台截图和后台点击",
+    ]),
     ("3.39", "2026-11-06", [
         "修正：改了目标粉丝数等设置后直接关掉程序不会保存；现在设置一改就自动保存，关闭前也会再存一次",
     ]),
@@ -389,6 +396,8 @@ DEFAULT_CFG = {
     "acc_order": [],           # 其他加速器：要依序点的按钮
     "launch_wait": 5,          # 启动后最多等几分钟进入主页
     "auto_focus": False,
+    "bg_mode": False,
+    "bg_click_method": "post", # 后台点击的方式：post / send / cursor（「测试后台模式」会自动找能用的）          # 后台模式（实验）：直接对游戏窗口截图、送点击，不切到前面、不动鼠标
     "mode": "auto_cycle",
     "cycle_minutes": 50,
     "cycle_run_now": False,
@@ -916,6 +925,152 @@ def grab(rect):
     return np.ascontiguousarray(np.array(shot)[:, :, :3])
 
 
+class _BMIH(ctypes.Structure):
+    _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32), ("biHeight", ctypes.c_int32),
+                ("biPlanes", ctypes.c_uint16), ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                ("biSizeImage", ctypes.c_uint32), ("biXPelsPerMeter", ctypes.c_int32),
+                ("biYPelsPerMeter", ctypes.c_int32), ("biClrUsed", ctypes.c_uint32), ("biClrImportant", ctypes.c_uint32)]
+
+
+def grab_window(hwnd):
+    """后台截图：让游戏窗口自己把画面画给我们（PrintWindow），被别的窗口挡住也截得到。
+    只回传游戏画面（不含标题列和边框）；截不到回传 None。"""
+    u32, g32 = ctypes.windll.user32, ctypes.windll.gdi32
+    try:
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        W, H = r - l, b - t
+        cx, cy = win32gui.ClientToScreen(hwnd, (0, 0))
+        _, _, cw, ch = win32gui.GetClientRect(hwnd)
+    except Exception:
+        return None
+    if W <= 0 or H <= 0 or cw <= 0 or ch <= 0:
+        return None
+    hdc = u32.GetWindowDC(hwnd)
+    mdc = g32.CreateCompatibleDC(hdc)
+    bmp = g32.CreateCompatibleBitmap(hdc, W, H)
+    old = g32.SelectObject(mdc, bmp)
+    try:
+        if not u32.PrintWindow(hwnd, mdc, 2):  # PW_RENDERFULLCONTENT：DirectX 游戏也画得出来
+            return None
+        bi = _BMIH()
+        bi.biSize, bi.biWidth, bi.biHeight = ctypes.sizeof(_BMIH), W, -H
+        bi.biPlanes, bi.biBitCount = 1, 32
+        buf = ctypes.create_string_buffer(W * H * 4)
+        if not g32.GetDIBits(mdc, bmp, 0, H, buf, ctypes.byref(bi), 0):
+            return None
+        img = np.frombuffer(buf, np.uint8).reshape(H, W, 4)[:, :, :3]
+        ox, oy = cx - l, cy - t
+        return np.ascontiguousarray(img[oy:oy + ch, ox:ox + cw])
+    finally:
+        g32.SelectObject(mdc, old)
+        g32.DeleteObject(bmp)
+        g32.DeleteDC(mdc)
+        u32.ReleaseDC(hwnd, hdc)
+
+
+WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEWHEEL = 0x0200, 0x0201, 0x0202, 0x020A
+WM_ACTIVATE, WM_SETCURSOR = 0x0006, 0x0020
+
+
+def _lp(x, y):
+    return (int(y) & 0xFFFF) << 16 | (int(x) & 0xFFFF)
+
+
+def bg_target(hwnd, x, y):
+    """点击要送到哪个窗口（游戏画面有时是子窗口），回传 (窗口, 在那个窗口里的坐标)。"""
+    try:
+        child = win32gui.ChildWindowFromPointEx(hwnd, (x, y), 1 | 2 | 4)  # 略过隐藏、停用、透明的
+        if child and child != hwnd:
+            sx, sy = win32gui.ClientToScreen(hwnd, (x, y))
+            cx, cy = win32gui.ScreenToClient(child, (sx, sy))
+            return child, cx, cy
+    except Exception:
+        pass
+    return hwnd, x, y
+
+
+BG_METHODS = ("post", "send", "cursor")
+BG_METHOD_NAME = {"post": "方式一（送讯息）", "send": "方式二（假装在前面再送讯息）",
+                  "cursor": "方式三（鼠标瞬间移过去再移回来）"}
+
+
+def bg_click(hwnd, x, y, hold=0.06, method="post"):
+    """后台点击：把鼠标按下 / 放开的讯息送给游戏窗口（x、y 是游戏画面里的坐标）。
+    post：只送讯息；send：先让游戏以为自己被点到前面再送；
+    cursor：鼠标瞬间移到按钮上、点完马上移回原位（约 0.1 秒），游戏窗口不会跳到前面。"""
+    tw, tx, ty = bg_target(hwnd, x, y)
+    lp = _lp(tx, ty)
+    if method == "send":
+        SM = win32api.SendMessage
+        SM(hwnd, 0x001C, 1, 0)                  # WM_ACTIVATEAPP
+        SM(hwnd, WM_ACTIVATE, 2, 0)             # WA_CLICKACTIVE
+        SM(hwnd, 0x0007, 0, 0)                  # WM_SETFOCUS
+        SM(tw, 0x0021, hwnd, _lp(1, WM_LBUTTONDOWN))  # WM_MOUSEACTIVATE
+        SM(tw, WM_SETCURSOR, tw, _lp(1, WM_LBUTTONDOWN))  # HTCLIENT
+        SM(tw, WM_MOUSEMOVE, 0, lp)
+        time.sleep(0.03)
+        SM(tw, WM_LBUTTONDOWN, 1, lp)
+        time.sleep(hold)
+        SM(tw, WM_LBUTTONUP, 0, lp)
+        return
+    if method == "cursor":
+        old = win32api.GetCursorPos()
+        sx, sy = win32gui.ClientToScreen(hwnd, (x, y))
+        try:
+            win32api.SetCursorPos((sx, sy))
+            win32api.PostMessage(hwnd, WM_ACTIVATE, 1, 0)
+            win32api.PostMessage(tw, WM_MOUSEMOVE, 0, lp)
+            time.sleep(0.03)
+            win32api.PostMessage(tw, WM_LBUTTONDOWN, 1, lp)
+            time.sleep(min(hold, 0.06))
+            win32api.PostMessage(tw, WM_LBUTTONUP, 0, lp)
+            time.sleep(0.03)
+        finally:
+            win32api.SetCursorPos(old)
+        return
+    win32api.PostMessage(hwnd, WM_ACTIVATE, 1, 0)   # 让游戏以为自己在前面，不然有些游戏不收点击
+    win32api.PostMessage(tw, WM_MOUSEMOVE, 0, lp)
+    time.sleep(0.03)
+    win32api.PostMessage(tw, WM_LBUTTONDOWN, 1, lp)  # MK_LBUTTON
+    time.sleep(hold)
+    win32api.PostMessage(tw, WM_LBUTTONUP, 0, lp)
+
+
+def bg_drag(hwnd, x0, y0, x1, y1, dur=0.4):
+    tw, tx, ty = bg_target(hwnd, x0, y0)
+    dx, dy = tx - x0, ty - y0
+    win32api.PostMessage(hwnd, WM_ACTIVATE, 1, 0)
+    win32api.PostMessage(tw, WM_MOUSEMOVE, 0, _lp(tx, ty))
+    win32api.PostMessage(tw, WM_LBUTTONDOWN, 1, _lp(tx, ty))
+    n = 12
+    for i in range(1, n + 1):
+        time.sleep(dur / n)
+        win32api.PostMessage(tw, WM_MOUSEMOVE, 1, _lp(x0 + (x1 - x0) * i / n + dx, y0 + (y1 - y0) * i / n + dy))
+    time.sleep(0.2)
+    win32api.PostMessage(tw, WM_LBUTTONUP, 0, _lp(x1 + dx, y1 + dy))
+
+
+def bg_scroll(hwnd, x, y, notches):
+    """后台滚轮：notches 正数往上、负数往下。滚轮讯息的坐标要用屏幕坐标。"""
+    tw, tx, ty = bg_target(hwnd, x, y)
+    sx, sy = win32gui.ClientToScreen(hwnd, (x, y))
+    win32api.PostMessage(tw, WM_MOUSEMOVE, 0, _lp(tx, ty))
+    step = 120 if notches > 0 else -120
+    for _ in range(abs(int(notches))):
+        win32api.PostMessage(tw, WM_MOUSEWHEEL, (step & 0xFFFF) << 16, _lp(sx, sy))
+        time.sleep(0.03)
+
+
+def restore_no_activate(hwnd):
+    """游戏缩到任务栏时还原，但不抢到前面（放到其他窗口后面）。"""
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE
+            win32gui.SetWindowPos(hwnd, 1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)  # 放最底下、不移动不改大小不激活
+    except Exception:
+        pass
+
+
 def tpl_path(key):
     return os.path.join(TPL_DIR, f"{key}.png")
 
@@ -1364,7 +1519,7 @@ class Bot(threading.Thread):
         hwnd = find_window(self.cfg["window_title"])
         if not hwnd:
             return None
-        if is_foreground(hwnd):
+        if is_foreground(hwnd) or self.cfg.get("bg_mode"):
             return hwnd
         auto = self.cfg.get("auto_focus")
         if auto and self.grab_focus(hwnd):
@@ -1445,6 +1600,8 @@ class Bot(threading.Thread):
         hwnd = self.ensure_active()
         if not hwnd:
             return None
+        if self.cfg.get("bg_mode"):
+            return self.capture_bg(hwnd)
         if win32gui.IsIconic(hwnd):
             # 游戏被缩到任务栏：先还原再截图（缩小时窗口位置是 -32000，截不到东西）
             try:
@@ -1474,6 +1631,38 @@ class Bot(threading.Thread):
                                                      interpolation=cv2.INTER_AREA)
         self.last_small = small
         return small
+
+    def capture_bg(self, hwnd):
+        """后台模式的截图：不切到前面。游戏缩到任务栏时会还原到其他窗口后面（缩小时游戏不画画面）。"""
+        if win32gui.IsIconic(hwnd):
+            restore_no_activate(hwnd)
+            self.wait(1.2)
+        self.rect = client_rect(hwnd)
+        full = grab_window(hwnd)
+        if full is None or full.size == 0 or float(full.mean()) < 2:
+            self.bg_black = getattr(self, "bg_black", 0) + 1
+            if self.bg_black in (5, 60):
+                self.log("后台截图一直是黑的：这台电脑或游戏可能不支持后台截图，请到「设置」关掉后台模式", "warn")
+            self.wait(1)
+            return self.last_small if getattr(self, "last_small", None) is not None else None
+        self.bg_black = 0
+        self.full = full
+        h, w = full.shape[:2]
+        if h != self.prep_h:
+            self.prepare(h)
+        small = full if self.f == 1.0 else cv2.resize(full, (round(w * self.f), round(h * self.f)),
+                                                     interpolation=cv2.INTER_AREA)
+        self.last_small = small
+        return small
+
+    def press(self, hwnd, px, py, on):
+        """在游戏画面座标 (px, py) 点一下：后台模式送讯息，不然用真的鼠标。"""
+        if self.cfg.get("bg_mode"):
+            bg_click(hwnd, px, py, random.uniform(0.045, 0.14) if on else 0.06,
+                     self.cfg.get("bg_click_method", "post"))
+        else:
+            x, y = self.rect[:2]
+            human_press(x + px, y + py, on)
 
     # 这些按钮一旦点错影响很大，不管设置里的严格度多低，至少要这么像
     MIN_THR = {"flow_auto_start": 0.85, "flow_ikusei_start": 0.85, "end_finish": 0.9}
@@ -1514,7 +1703,7 @@ class Bot(threading.Thread):
                 self.log(f"「{label}」的位置在游戏窗口外面，没有点", "warn")
                 self.wait(0.5)
                 return False
-        human_press(x + px, y + py, on)
+        self.press(hwnd, px, py, on)
         self.log(f"点击 {label}", "ok")
         changed = prev is None
         if prev is not None:
@@ -1811,7 +2000,7 @@ class Bot(threading.Thread):
             self.wait(0.5)
 
     def clear_desktop(self, hwnd=None):
-        if not self.cfg.get("minimize_others", True):
+        if not self.cfg.get("minimize_others", True) or self.cfg.get("bg_mode"):
             return
         hwnd = hwnd or find_window(self.cfg["window_title"])
         if not hwnd:
@@ -2209,10 +2398,16 @@ class Bot(threading.Thread):
                     self.log("列表从上到下都找不到指定的马娘（sel_chara），用现在选的", "warn")
                     self.chara_ok = True
                     return False
-                x = self.rect[0] + int(x0 / self.f)
-                y = self.rect[1] + int(y0 / self.f)
-                real_move(x, y, 0.2)
-                pyautogui.scroll(15 if self.chara_phase == "top" else -3, x, y)
+                notches = 15 if self.chara_phase == "top" else -3
+                if self.cfg.get("bg_mode"):
+                    hw = find_window(self.cfg["window_title"])
+                    if hw:
+                        bg_scroll(hw, int(x0 / self.f), int(y0 / self.f), notches)
+                else:
+                    x = self.rect[0] + int(x0 / self.f)
+                    y = self.rect[1] + int(y0 / self.f)
+                    real_move(x, y, 0.2)
+                    pyautogui.scroll(notches, x, y)
                 self.wait(0.8)
                 return True
         if not self.deck_ok and {"sel_deck", "sel_copy"} <= set(self.tpls):
@@ -3417,6 +3612,10 @@ class Bot(threading.Thread):
 
     def launch_game(self):
         """打开加速器 → 依序点按钮（加速、启动游戏）→ 等游戏窗口 → 进入主页。"""
+        try:
+            self.fg_before_launch = win32gui.GetForegroundWindow()
+        except Exception:
+            self.fg_before_launch = None
         path = self.cfg.get("uu_path", "")
         game = self.cfg.get("game_path", "")
         has_game = bool(game) and os.path.exists(game)
@@ -3495,8 +3694,18 @@ class Bot(threading.Thread):
             return False
         self.log("游戏窗口已出现，等待进入主页")
         self.wait(5)
-        self.clear_desktop(hwnd)
-        force_foreground(hwnd)
+        if self.cfg.get("bg_mode"):
+            # 游戏刚打开会自己跳到最前面：放回其他窗口后面，把前面还给你原本在用的窗口
+            prev = getattr(self, "fg_before_launch", None)
+            try:
+                win32gui.SetWindowPos(hwnd, 1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+            except Exception:
+                pass
+            if prev and prev != hwnd and win32gui.IsWindow(prev):
+                force_foreground(prev)
+        else:
+            self.clear_desktop(hwnd)
+            force_foreground(hwnd)
         old = self.cfg.get("auto_focus")
         self.cfg["auto_focus"] = True  # 启动阶段没人看着，允许自动切到游戏
         try:
@@ -3517,7 +3726,7 @@ class Bot(threading.Thread):
             if not hwnd:
                 self.wait(2)
                 continue
-            if not is_foreground(hwnd):
+            if not is_foreground(hwnd) and not self.cfg.get("bg_mode"):
                 force_foreground(hwnd)
             img = self.capture()
             if img is None:
@@ -3625,12 +3834,15 @@ class Bot(threading.Thread):
             return
         self.rect = client_rect(hwnd)
         x, y, w, h = self.rect
-        cx = x + w // 2
-        pyautogui.moveTo(cx, y + int(h * 0.7))
-        pyautogui.mouseDown()
-        pyautogui.moveTo(cx, y + int(h * 0.35), duration=0.4)
-        time.sleep(0.2)
-        pyautogui.mouseUp()
+        if self.cfg.get("bg_mode"):
+            bg_drag(hwnd, w // 2, int(h * 0.7), w // 2, int(h * 0.35))
+        else:
+            cx = x + w // 2
+            pyautogui.moveTo(cx, y + int(h * 0.7))
+            pyautogui.mouseDown()
+            pyautogui.moveTo(cx, y + int(h * 0.35), duration=0.4)
+            time.sleep(0.2)
+            pyautogui.mouseUp()
         self.log(f"往下滚动找未读剧情（{self.scrolls}/{self.cfg['story_max_scroll']}）")
         self.wait(self.cfg["delay"])
 
@@ -4022,6 +4234,7 @@ class App:
         self.v_thr = tk.DoubleVar(value=self.cfg["match_threshold"])
         self.v_delay = tk.DoubleVar(value=self.cfg["delay"])
         self.v_auto_focus = tk.BooleanVar(value=self.cfg.get("auto_focus", False))
+        self.v_bg_mode = tk.BooleanVar(value=self.cfg.get("bg_mode", False))
         self.v_minimize = tk.BooleanVar(value=self.cfg.get("minimize_on_start", True))
         self.v_min_others = tk.BooleanVar(value=self.cfg.get("minimize_others", True))
         self.v_humanize = tk.BooleanVar(value=self.cfg.get("humanize", True))
@@ -4728,8 +4941,15 @@ class App:
                  lambda p: tb.Spinbox(p, from_=0.6, to=0.99, increment=0.01, textvariable=self.v_thr, width=7))
         self.row(box, "每次点击后等待（秒）",
                  lambda p: tb.Spinbox(p, from_=0.1, to=5, increment=0.1, textvariable=self.v_delay, width=7))
+        bgf = tb.Frame(box)
+        bgf.pack(anchor=W, fill=X, pady=(10, 0))
+        tb.Checkbutton(bgf, text="后台模式（实验）：不切到前面、不动你的鼠标，可以同时玩别的游戏",
+                       variable=self.v_bg_mode, bootstyle="info-round-toggle").pack(side=LEFT)
+        tb.Button(bgf, text="测试后台模式", bootstyle="info-outline", command=self.test_bg_mode).pack(side=LEFT, padx=(10, 0))
+        tb.Label(box, text="游戏可以被挡住，但不要缩到任务栏；用 UU 加速器启动时，点加速器那几下还是会用到鼠标。",
+                 bootstyle="secondary", font=(FONT, 9)).pack(anchor=W, padx=(48, 0))
         tb.Checkbutton(box, text="需要点击时自动把游戏切到最前面（关闭则暂停，等你切回游戏）",
-                       variable=self.v_auto_focus, bootstyle="success-round-toggle").pack(anchor=W, pady=(10, 0))
+                       variable=self.v_auto_focus, bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
         tb.Checkbutton(box, text="点启动后程序自己缩到任务栏（停止后再弹回来）",
                        variable=self.v_minimize, bootstyle="success-round-toggle").pack(anchor=W, pady=(6, 0))
         tb.Checkbutton(box, text="开游戏和每轮开始操作时，把游戏以外的窗口全部最小化",
@@ -5183,6 +5403,55 @@ class App:
         else:
             self.lbl_ready.configure(text=f"必需模板 {done}/{len(req)} 已齐，可以启动", bootstyle="success")
 
+    def test_bg_mode(self):
+        """测试后台截图；截得到就依序试三种后台点击，看哪一种能让游戏有反应，自动记下来。"""
+        hwnd = find_window(self.cfg.get("window_title", "umamusume"))
+        if not hwnd:
+            messagebox.showinfo(APP_NAME, "找不到游戏窗口，请先打开游戏。")
+            return
+        set_thread_dpi_aware()
+        img = grab_window(hwnd)
+        ok = img is not None and img.size and float(img.mean()) >= 2
+        if ok:
+            os.makedirs(os.path.join(BASE, "debug"), exist_ok=True)
+            cv2.imencode(".png", img)[1].tofile(os.path.join(BASE, "debug", "bg_test.png"))
+        if not ok:
+            messagebox.showwarning(APP_NAME, "后台截图失败（截到的是黑画面）。\n这台电脑或游戏不支持后台模式，请先不要打开。")
+            return
+        if not messagebox.askyesno(APP_NAME, "后台截图成功。\n\n接下来测试后台点击：请把游戏停在「主页」，再切到别的窗口。\n"
+                                   "按「是」后 3 秒开始，会依序试三种方式点「育成」按钮，\n"
+                                   "每试一种就自动看游戏有没有进到下一个画面（大约 10 秒），过程中不要动游戏。"):
+            return
+
+        def run():
+            set_thread_dpi_aware()
+            time.sleep(3)
+            try:
+                for m in BG_METHODS:
+                    bot = Bot(dict(self.cfg, bg_mode=True, bg_click_method=m), self.log, self.fans)
+                    img = bot.capture()
+                    pt = bot.find(img, "flow_home") if img is not None else None
+                    if not pt:
+                        self.log("后台截图里找不到「育成」按钮：请先把游戏停在主页再测试", "warn")
+                        return
+                    self.log(f"试{BG_METHOD_NAME[m]}…")
+                    before = bot.last_small.copy()
+                    bot.click(pt, f"育成（{BG_METHOD_NAME[m]}）")
+                    time.sleep(2.5)
+                    after = bot.capture()
+                    if after is not None and after.shape == before.shape and \
+                            float(cv2.absdiff(after, before).mean()) > 8 and not bot.find(after, "flow_home"):
+                        self.cfg["bg_click_method"] = m
+                        save_cfg(self.cfg)
+                        self.log(f"{BG_METHOD_NAME[m]}可以用！已经记下来，打开「后台模式」就会用这个方式。"
+                                 "请把游戏按返回回到主页", "ok")
+                        return
+                    self.log(f"{BG_METHOD_NAME[m]}没反应", "warn")
+                self.log("三种后台点击游戏都没反应，这个游戏不能用后台模式，请把它关掉", "err")
+            except Exception as e:
+                self.log(f"后台测试出错：{e}", "err")
+        threading.Thread(target=run, daemon=True).start()
+
     def schedule_autosave(self):
         if self._autosave_job:
             self.root.after_cancel(self._autosave_job)
@@ -5220,6 +5489,7 @@ class App:
                 match_threshold=float(self.v_thr.get()),
                 delay=float(self.v_delay.get()),
                 auto_focus=bool(self.v_auto_focus.get()),
+                bg_mode=bool(self.v_bg_mode.get()),
                 minimize_on_start=bool(self.v_minimize.get()),
                 minimize_others=bool(self.v_min_others.get()),
                 humanize=bool(self.v_humanize.get()),
