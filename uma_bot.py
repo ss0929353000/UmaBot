@@ -78,10 +78,22 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 APP_NAME = "赛马娘助手"
-VERSION = "3.42"
+VERSION = "3.46"
 # 更新公告：每次发新版本，在最上面加一条（版本号, 日期, [更新内容]）。
 # 用户更新后第一次打开会自动弹出；make_release.py 也会拿这里的内容当作更新提示。
 CHANGELOG = [
+    ("3.46", "2026-11-27", [
+        "修正：后台模式往上翻马娘列表时，起点太高按到列表外面，拖不动；改成从列表中间开始拖",
+    ]),
+    ("3.45", "2026-11-27", [
+        "修正：后台模式找马娘时还没拉到最上面就开始往下找；现在至少往上拖 6 次、确定拖不动了才从上往下找",
+    ]),
+    ("3.44", "2026-11-27", [
+        "修正：后台模式下马娘列表还是滚不动；改成用拖动来翻列表",
+    ]),
+    ("3.43", "2026-11-27", [
+        "修正：后台模式下马娘列表滚不动（找不到指定马娘）；滚动和拖动时鼠标会先瞬间停到列表上，滚完移回原位",
+    ]),
     ("3.42", "2026-11-26", [
         "修正：「育成收益」的育成次数把每次按启动后的第一轮（只开新育成、没有结束育成）也算进去，次数会多算、平均粉丝变少",
     ]),
@@ -1039,29 +1051,57 @@ def bg_click(hwnd, x, y, hold=0.06, method="post"):
     win32api.PostMessage(tw, WM_LBUTTONUP, 0, lp)
 
 
-def bg_drag(hwnd, x0, y0, x1, y1, dur=0.4):
+def _cursor_to(hwnd, x, y):
+    sx, sy = win32gui.ClientToScreen(hwnd, (int(x), int(y)))
+    win32api.SetCursorPos((sx, sy))
+
+
+def bg_drag(hwnd, x0, y0, x1, y1, dur=0.4, method="post"):
+    """后台拖动。cursor 方式：拖的过程鼠标跟着走（约 0.6 秒），结束后移回原位。"""
     tw, tx, ty = bg_target(hwnd, x0, y0)
     dx, dy = tx - x0, ty - y0
-    win32api.PostMessage(hwnd, WM_ACTIVATE, 1, 0)
-    win32api.PostMessage(tw, WM_MOUSEMOVE, 0, _lp(tx, ty))
-    win32api.PostMessage(tw, WM_LBUTTONDOWN, 1, _lp(tx, ty))
-    n = 12
-    for i in range(1, n + 1):
-        time.sleep(dur / n)
-        win32api.PostMessage(tw, WM_MOUSEMOVE, 1, _lp(x0 + (x1 - x0) * i / n + dx, y0 + (y1 - y0) * i / n + dy))
-    time.sleep(0.2)
-    win32api.PostMessage(tw, WM_LBUTTONUP, 0, _lp(x1 + dx, y1 + dy))
+    old = win32api.GetCursorPos() if method == "cursor" else None
+    try:
+        if old:
+            _cursor_to(hwnd, x0, y0)
+        win32api.PostMessage(hwnd, WM_ACTIVATE, 1, 0)
+        win32api.PostMessage(tw, WM_MOUSEMOVE, 0, _lp(tx, ty))
+        win32api.PostMessage(tw, WM_LBUTTONDOWN, 1, _lp(tx, ty))
+        n = 12
+        for i in range(1, n + 1):
+            time.sleep(dur / n)
+            x, y = x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n
+            if old:
+                _cursor_to(hwnd, x, y)
+            win32api.PostMessage(tw, WM_MOUSEMOVE, 1, _lp(x + dx, y + dy))
+        time.sleep(0.2)
+        win32api.PostMessage(tw, WM_LBUTTONUP, 0, _lp(x1 + dx, y1 + dy))
+    finally:
+        if old:
+            win32api.SetCursorPos(old)
 
 
-def bg_scroll(hwnd, x, y, notches):
-    """后台滚轮：notches 正数往上、负数往下。滚轮讯息的坐标要用屏幕坐标。"""
+def bg_scroll(hwnd, x, y, notches, method="post"):
+    """后台滚轮：notches 正数往上、负数往下。滚轮讯息的坐标要用屏幕坐标。
+    cursor 方式：滚的时候鼠标先停在列表上（游戏要看鼠标在哪里才知道滚哪个列表），滚完移回原位。"""
     tw, tx, ty = bg_target(hwnd, x, y)
     sx, sy = win32gui.ClientToScreen(hwnd, (x, y))
-    win32api.PostMessage(tw, WM_MOUSEMOVE, 0, _lp(tx, ty))
-    step = 120 if notches > 0 else -120
-    for _ in range(abs(int(notches))):
-        win32api.PostMessage(tw, WM_MOUSEWHEEL, (step & 0xFFFF) << 16, _lp(sx, sy))
-        time.sleep(0.03)
+    old = win32api.GetCursorPos() if method == "cursor" else None
+    try:
+        if old:
+            win32api.SetCursorPos((sx, sy))
+            time.sleep(0.03)
+        win32api.PostMessage(hwnd, WM_ACTIVATE, 1, 0)
+        win32api.PostMessage(tw, WM_MOUSEMOVE, 0, _lp(tx, ty))
+        step = 120 if notches > 0 else -120
+        for _ in range(abs(int(notches))):
+            win32api.PostMessage(tw, WM_MOUSEWHEEL, (step & 0xFFFF) << 16, _lp(sx, sy))
+            time.sleep(0.03)
+        if old:
+            time.sleep(0.1)
+    finally:
+        if old:
+            win32api.SetCursorPos(old)
 
 
 def restore_no_activate(hwnd):
@@ -2395,19 +2435,29 @@ class Bot(threading.Thread):
                 self.chara_still = 0 if moved else self.chara_still + 1
                 self.chara_scrolls += 1
                 if self.chara_phase == "top":
-                    if (self.chara_still >= 1 and self.chara_scrolls > 1) or self.chara_scrolls > 12:
+                    # 后台模式用拖动，一次翻得少、偶尔会没拖动：至少拖 6 次、连续两次没动才算到顶
+                    bg = self.cfg.get("bg_mode")
+                    need_still, min_n, max_n = (2, 6, 20) if bg else (1, 2, 12)
+                    if (self.chara_still >= need_still and self.chara_scrolls >= min_n) or self.chara_scrolls > max_n:
                         self.chara_phase = "down"
                         self.chara_still = 0
                         self.log("马娘列表已拉到最上面，从上往下找")
-                elif self.chara_still >= 2 or self.chara_scrolls > 60:
+                elif self.chara_still >= (3 if self.cfg.get("bg_mode") else 2) or self.chara_scrolls > 80:
                     self.log("列表从上到下都找不到指定的马娘（sel_chara），用现在选的", "warn")
                     self.chara_ok = True
                     return False
                 notches = 15 if self.chara_phase == "top" else -3
                 if self.cfg.get("bg_mode"):
+                    # 后台模式游戏不吃滚轮：改用拖动翻列表（往下拖＝往上翻）
                     hw = find_window(self.cfg["window_title"])
                     if hw:
-                        bg_scroll(hw, int(x0 / self.f), int(y0 / self.f), notches)
+                        fx, fy, fh = int(x0 / self.f), int(y0 / self.f), int(h / self.f)
+                        m = self.cfg.get("bg_click_method", "post")
+                        if self.chara_phase == "top":
+                            # 从列表中间往下拖（起点太高会按在列表外面，拖不动）
+                            bg_drag(hw, fx, fy, fx, fy + int(0.25 * fh), 0.3, m)
+                        else:
+                            bg_drag(hw, fx, fy + int(0.06 * fh), fx, fy - int(0.06 * fh), 0.5, m)
                 else:
                     x = self.rect[0] + int(x0 / self.f)
                     y = self.rect[1] + int(y0 / self.f)
@@ -3840,7 +3890,8 @@ class Bot(threading.Thread):
         self.rect = client_rect(hwnd)
         x, y, w, h = self.rect
         if self.cfg.get("bg_mode"):
-            bg_drag(hwnd, w // 2, int(h * 0.7), w // 2, int(h * 0.35))
+            bg_drag(hwnd, w // 2, int(h * 0.7), w // 2, int(h * 0.35),
+                    method=self.cfg.get("bg_click_method", "post"))
         else:
             cx = x + w // 2
             pyautogui.moveTo(cx, y + int(h * 0.7))
